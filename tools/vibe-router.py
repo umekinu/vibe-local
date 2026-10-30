@@ -15,16 +15,153 @@ API形式変換は一切しない = 壊れる場所がない。
                  --main vibe-coder --fast vibe-fast --sig <識別文字列>
 
 ヘルスチェック: GET /vibe-router/health → {"sig": ..., "main": ..., "fast": ...}
+
+kaizen (学び続けるループの 検証→記録):
+  /chat/completions の応答を素通ししながら写しを取り、ROADMAPの失敗パターン
+  (文章だけで返す・質問で終わる・ユーザーに実行させる・簡体字混入 等) を判定して
+  --events のJSONLに1応答1行で追記する。記録は種類・件数・時間だけで、
+  会話本文は一切残さない (機密データを扱う環境で使うため)。
+  集計は tools/vibe-kaizen.py。--events "" で無効。
 """
 import argparse
 import json
+import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AUTO_MODEL = "vibe-auto"
+
+# --- kaizen: 応答の判定 ---------------------------------------------------
+# 判定の対象はツールを渡されたエージェント応答だけ (タイトル生成等は除く)
+SLOW_MS = 60000
+ASKS_USER_TO_RUN = re.compile(
+    r"ターミナルで(?:実行|入力)|以下のコマンドを(?:実行|入力)してください|"
+    r"コマンドを(?:実行|入力)してください|"
+    r"run (?:the following|this) command|in your terminal",
+    re.IGNORECASE,
+)
+KANA = re.compile(r"[぀-ヿ]")
+# 日本語では使わない簡体字 (P1-4 の実例「或者」等の周辺)
+SIMPLIFIED_ONLY = re.compile(r"[这们么说时进还过对发经问实现个吗呢]")
+
+
+def last_user_text(body):
+    for m in reversed(body.get("messages") or []):
+        if m.get("role") == "user":
+            return text_of(m.get("content"))
+    return ""
+
+
+def kaizen_flags(n_tools, user_text, scan, status):
+    """1応答の判定結果 (パターンIDの一覧)。本文はここで捨てる。"""
+    flags = []
+    if status >= 400:
+        flags.append("upstream_error")
+        return flags
+    if scan.parse_error:
+        flags.append("parse_error")
+    text = scan.text.strip()
+    if n_tools > 0:
+        if not text and scan.tool_calls == 0:
+            flags.append("empty_response")
+        if scan.tool_calls == 0 and text:
+            flags.append("text_only")                     # P0-1 (率で見る)
+            if text[-1:] in ("?", "？"):
+                flags.append("ends_with_question")        # P0-2
+        if ASKS_USER_TO_RUN.search(text):
+            flags.append("asks_user_to_run")              # P0-3
+    if KANA.search(user_text) and SIMPLIFIED_ONLY.search(text):
+        flags.append("simplified_zh")                     # P1-4
+    if scan.latency_ms > SLOW_MS:
+        flags.append("slow")
+    return flags
+
+
+class RespScan:
+    """応答 (JSON または SSE) を流れのまま読み、本文とツール呼び出し数を数える"""
+
+    MAX_TEXT = 20000   # 判定に要るのは末尾と語句だけ
+
+    def __init__(self, streaming):
+        self.streaming = streaming
+        self.buf = b""
+        self.text = ""
+        self.tool_idx = set()
+        self.parse_error = False
+        self.t0 = time.monotonic()
+        self.latency_ms = 0
+
+    @property
+    def tool_calls(self):
+        return len(self.tool_idx)
+
+    def _take(self, choice):
+        part = choice.get("delta") or choice.get("message") or {}
+        c = part.get("content")
+        if isinstance(c, str) and c:
+            self.text = (self.text + c)[-self.MAX_TEXT:]
+        for i, tc in enumerate(part.get("tool_calls") or []):
+            self.tool_idx.add(tc.get("index", i) if isinstance(tc, dict) else i)
+
+    def feed(self, chunk):
+        try:
+            self.buf += chunk
+            if not self.streaming:
+                return
+            *lines, self.buf = self.buf.split(b"\n")
+            for line in lines:
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == b"[DONE]":
+                    continue
+                for ch in json.loads(data).get("choices") or []:
+                    self._take(ch)
+        except Exception:
+            self.parse_error = True
+
+    def finish(self):
+        self.latency_ms = int((time.monotonic() - self.t0) * 1000)
+        try:
+            if self.streaming:
+                self.feed(b"\n")
+            elif self.buf:
+                for ch in json.loads(self.buf).get("choices") or []:
+                    self._take(ch)
+        except Exception:
+            self.parse_error = True
+        self.buf = b""
+
+
+class EventLog:
+    """1応答1行のJSONL。書き込みに失敗しても転送は止めない"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        if path:
+            try:
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            except Exception:
+                self.path = ""
+
+    def write(self, event):
+        if not self.path:
+            return
+        try:
+            line = json.dumps(event, ensure_ascii=False) + "\n"
+            with self.lock:
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
 
 # コーディング/作業タスクを示す語 (どれかを含めば main 行き)
 WORK_WORDS = re.compile(
@@ -83,7 +220,9 @@ def pick_model(body, main, fast):
     return fast, "chat"
 
 
-def make_handler(upstream, main, fast, sig):
+def make_handler(upstream, main, fast, sig, events=None):
+    events = events or EventLog("")
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -100,8 +239,10 @@ def make_handler(upstream, main, fast, sig):
             self.end_headers()
             self.wfile.write(payload)
 
-        def _forward(self, body):
+        def _forward(self, body, meta=None):
             url = upstream + self.path
+            scan = None
+            status = 0
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in ("host", "content-length",
                                             "connection", "accept-encoding")}
@@ -118,10 +259,15 @@ def make_handler(upstream, main, fast, sig):
                 self.send_header("Content-Length", str(len(msg)))
                 self.end_headers()
                 self.wfile.write(msg)
+                self._record(meta, None, 502)
                 return
             with resp:
+                status = resp.status
                 self.send_response(resp.status)
                 length = resp.headers.get("Content-Length")
+                if meta is not None:
+                    scan = RespScan(streaming=length is None)
+                    scan.t0 = meta["t0"]   # 待ち時間はリクエスト送信から数える
                 for k, v in resp.getheaders():
                     if k.lower() in ("transfer-encoding", "connection",
                                      "content-length"):
@@ -135,6 +281,8 @@ def make_handler(upstream, main, fast, sig):
                         if not chunk:
                             break
                         self.wfile.write(chunk)
+                        if scan:
+                            scan.feed(chunk)
                 else:
                     # ストリーミング(SSE等) → chunked で流し込む
                     self.send_header("Transfer-Encoding", "chunked")
@@ -147,7 +295,30 @@ def make_handler(upstream, main, fast, sig):
                         self.wfile.write(chunk)
                         self.wfile.write(b"\r\n")
                         self.wfile.flush()
+                        if scan:
+                            scan.feed(chunk)
                     self.wfile.write(b"0\r\n\r\n")
+            self._record(meta, scan, status)
+
+        def _record(self, meta, scan, status):
+            """kaizen: 判定して1行記録。本文は残さない"""
+            if meta is None:
+                return
+            try:
+                t0 = meta.pop("t0")
+                if scan is None:
+                    scan = RespScan(streaming=False)
+                    scan.t0 = t0
+                scan.finish()
+                flags = kaizen_flags(meta["n_tools"], meta.pop("user_text"),
+                                     scan, status)
+                events.write(dict(meta, status=status,
+                                  latency_ms=scan.latency_ms,
+                                  out_chars=len(scan.text),
+                                  tool_calls=scan.tool_calls,
+                                  flags=flags))
+            except Exception:
+                pass
 
         def do_GET(self):
             if self.path == "/vibe-router/health":
@@ -157,6 +328,7 @@ def make_handler(upstream, main, fast, sig):
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            meta = None
             if self.path.endswith("/chat/completions"):
                 try:
                     d = json.loads(body)
@@ -174,9 +346,15 @@ def make_handler(upstream, main, fast, sig):
                         d.setdefault("reasoning_effort", "none")
                     body = json.dumps(d).encode()
                     print(f"route: {d.get('model')} ({why}) {size_note}", flush=True)
+                    meta = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "t0": time.monotonic(),
+                            "model": d.get("model"), "why": why,
+                            "n_msgs": len(d.get("messages") or []),
+                            "n_tools": len(d.get("tools") or []),
+                            "user_text": last_user_text(d)}
                 except Exception as e:
                     print(f"route: passthrough (parse error: {e})", flush=True)
-            self._forward(body)
+            self._forward(body, meta)
 
         def do_DELETE(self):
             self._forward(None)
@@ -191,10 +369,13 @@ def main():
     ap.add_argument("--main", default="vibe-coder")
     ap.add_argument("--fast", default="vibe-fast")
     ap.add_argument("--sig", default="dev")
+    ap.add_argument("--events", default="",
+                    help="kaizenの記録先JSONL (空なら記録しない)")
     a = ap.parse_args()
     srv = ThreadingHTTPServer(
         ("127.0.0.1", a.port),
-        make_handler(a.upstream.rstrip("/"), a.main, a.fast, a.sig),
+        make_handler(a.upstream.rstrip("/"), a.main, a.fast, a.sig,
+                     EventLog(a.events)),
     )
     print(f"vibe-router: 127.0.0.1:{a.port} -> {a.upstream} "
           f"(auto: chat->{a.fast} / work->{a.main})", flush=True)

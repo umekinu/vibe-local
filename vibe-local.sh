@@ -27,9 +27,12 @@
 #   vibe-local --serve            # 教室モード: LANにサーバー公開 (実験的)
 #   vibe-local --attach URL       # 教室モード: 先生のサーバーに接続 (実験的)
 #   vibe-local --doctor           # 環境診断
+#   vibe-local --kaizen           # 失敗パターンの集計と改善の候補 (直近7日)
 #   vibe-local --rebuild          # モデル別名とパッチ済みTUIを作り直す
 #
 #   VIBE_LOCAL_NO_SPLASH=1 vibe-local   # 起動アニメーションを省略
+#   VIBE_LOCAL_NO_KAIZEN=1 vibe-local   # 応答の判定・記録をしない
+#     (記録は ~/.local/state/vibe-local/kaizen/ に種類・件数・時間だけ。本文は残さない)
 
 set -uo pipefail
 
@@ -280,7 +283,11 @@ ensure_router() {
     done
     [ -z "$script" ] && return 1
     command -v python3 &>/dev/null || return 1
-    sig="v${VIBE_VERSION}|${MAIN_ALIAS}|${SMALL_ALIAS}|${OLLAMA_HOST}"
+    # kaizen: 応答の判定・記録 (本文は残さない)。VIBE_LOCAL_NO_KAIZEN=1 で無効
+    local events="${STATE_DIR}/kaizen/events.jsonl"
+    [ "${VIBE_LOCAL_NO_KAIZEN:-0}" = "1" ] && events=""
+    # ルーター本体の更新でも再起動されるよう、中身のチェックサムを sig に含める
+    sig="v${VIBE_VERSION}|${MAIN_ALIAS}|${SMALL_ALIAS}|${OLLAMA_HOST}|$(cksum < "$script" | cut -d' ' -f1)|k${events:+1}"
     health="$(curl -s --max-time 1 "http://127.0.0.1:${ROUTER_PORT}/vibe-router/health" 2>/dev/null || true)"
     if echo "$health" | grep -qF "\"sig\": \"$sig\""; then
         ROUTER_OK=1
@@ -292,7 +299,7 @@ ensure_router() {
         rm -f "${STATE_DIR}/router.pid"
     fi
     nohup python3 "$script" --port "$ROUTER_PORT" --upstream "$OLLAMA_HOST" \
-        --main "$MAIN_ALIAS" --fast "$SMALL_ALIAS" --sig "$sig" \
+        --main "$MAIN_ALIAS" --fast "$SMALL_ALIAS" --sig "$sig" --events "$events" \
         >> "${STATE_DIR}/router.log" 2>&1 < /dev/null &
     echo $! > "${STATE_DIR}/router.pid"
     disown 2>/dev/null || true
@@ -304,6 +311,20 @@ ensure_router() {
         fi
         sleep 0.2
     done
+    return 1
+}
+
+# --- kaizen 集計 (学び続けるループの「抽出」) ---
+# ルーターの記録を集計して改善の候補を出すだけ。何も書き換えない (格上げは人が決める)
+run_kaizen() {
+    local c
+    for c in "${SCRIPT_DIR}/tools/vibe-kaizen.py" "${LIB_DIR}/vibe-kaizen.py"; do
+        if [ -f "$c" ]; then
+            python3 "$c" "$1" --events "${STATE_DIR}/kaizen/events.jsonl"
+            return
+        fi
+    done
+    [ "$1" = "report" ] && echo "vibe-kaizen.py が見つかりません (install.sh を再実行してください)"
     return 1
 }
 
@@ -625,6 +646,7 @@ while [[ $# -gt 0 ]]; do
         --attach)   ATTACH_URL="$2"; shift 2 ;;
         -p|--prompt) PROMPT="$2"; shift 2 ;;
         --doctor)   doctor; exit 0 ;;
+        --kaizen)   run_kaizen report; exit 0 ;;
         --print-config) PRINT_CONFIG=1; shift ;;
         --rebuild)  REBUILD=1; shift ;;
         --version)  echo "vibe-local v${VIBE_VERSION}"; exit 0 ;;
@@ -804,6 +826,8 @@ if [ -n "$PROMPT" ]; then
     # ワンショットは演出なしで即実行
     exec "$OPENCODE_BIN" run "$PROMPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
+
+[ "${VIBE_LOCAL_NO_KAIZEN:-0}" = "1" ] || run_kaizen summary 2>/dev/null || true
 
 MODE_LABEL="vibe TUI"
 [ "$FAST_MODE" -eq 1 ] && MODE_LABEL="vibe TUI (fast)"

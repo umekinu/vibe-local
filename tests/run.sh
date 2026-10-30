@@ -100,6 +100,98 @@ done
 kill \$RPID 2>/dev/null
 exit \$ok'"
 
+echo "== kaizen (検証→記録→抽出) =="
+check "vibe-kaizen.py 構文"           "python3 -m py_compile tools/vibe-kaizen.py"
+check "--help に --kaizen"            "./vibe-local.sh --help | grep -q -- '--kaizen'"
+check "応答の判定 (ROADMAPの失敗パターン)" "python3 - <<'EOF'
+import importlib.util, json
+spec = importlib.util.spec_from_file_location('vr', 'tools/vibe-router.py')
+vr = importlib.util.module_from_spec(spec); spec.loader.exec_module(vr)
+def sse(*deltas):
+    s = vr.RespScan(streaming=True)
+    for d in deltas:
+        s.feed(b'data: ' + json.dumps({'choices': [{'delta': d}]}).encode() + b'\n\n')
+    s.feed(b'data: [DONE]\n\n'); s.finish(); return s
+f = lambda scan, n_tools=3, user='これを直して', status=200: vr.kaizen_flags(n_tools, user, scan, status)
+assert f(sse({'content': '何か'}, {'content': '必要ですか？'})) == ['text_only', 'ends_with_question']
+assert f(sse({'tool_calls': [{'index': 0}]}, {'tool_calls': [{'index': 0}]})) == []      # ツール呼び出し1件
+assert 'asks_user_to_run' in f(sse({'content': '以下のコマンドを実行してください'}))
+assert 'simplified_zh' in f(sse({'content': '这个文件'}))
+assert 'simplified_zh' not in f(sse({'content': '这个文件'}), user='fix this')       # 日本語の会話だけ
+assert f(sse({'content': 'タイトル？'}), n_tools=0) == []                             # タイトル生成等は対象外
+assert f(sse(), status=500) == ['upstream_error']
+s = vr.RespScan(streaming=False)
+s.feed(json.dumps({'choices': [{'message': {'content': 'ok', 'tool_calls': [{}, {}]}}]}).encode())
+s.finish(); assert s.tool_calls == 2 and s.text == 'ok'
+b = vr.RespScan(streaming=True); b.feed(b'data: {broken\n'); b.finish()
+assert 'parse_error' in f(b)
+EOF"
+check "ルーター経由の記録: 素通しのまま1行記録・本文は残らない" "python3 - <<'EOF'
+import json, os, subprocess, sys, tempfile, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+REPLY = '秘密マーカーB_9137は必要ですか？'
+class Up(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers['Content-Length']))
+        self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
+        for part in (REPLY[:6], REPLY[6:]):
+            self.wfile.write(b'data: ' + json.dumps({'choices': [{'delta': {'content': part}}]}).encode() + b'\n\n')
+        self.wfile.write(b'data: [DONE]\n\n')
+up = HTTPServer(('127.0.0.1', 21436), Up)
+threading.Thread(target=up.serve_forever, daemon=True).start()
+ev = os.path.join(tempfile.mkdtemp(), 'k', 'events.jsonl')
+r = subprocess.Popen([sys.executable, 'tools/vibe-router.py', '--port', '21437',
+                      '--upstream', 'http://127.0.0.1:21436', '--events', ev],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(25):
+        try:
+            urllib.request.urlopen('http://127.0.0.1:21437/vibe-router/health', timeout=1); break
+        except Exception: time.sleep(0.2)
+    req = {'model': 'vibe-coder', 'stream': True, 'tools': [{}],
+           'messages': [{'role': 'user', 'content': '秘密マーカーA_5521 のファイルを直して'}]}
+    out = urllib.request.urlopen(urllib.request.Request(
+        'http://127.0.0.1:21437/v1/chat/completions', data=json.dumps(req).encode(),
+        headers={'Content-Type': 'application/json'}), timeout=10).read().decode()
+    assert 'B_9137' in out and out.rstrip().endswith('[DONE]'), out           # 素通し
+    time.sleep(0.3)
+    raw = open(ev, encoding='utf-8').read()
+    lines = raw.strip().splitlines()
+    assert len(lines) == 1, lines
+    e = json.loads(lines[0])
+    assert e['flags'] == ['text_only', 'ends_with_question'], e
+    assert e['model'] == 'vibe-coder' and e['n_tools'] == 1 and e['tool_calls'] == 0, e
+    assert 'A_5521' not in raw and 'B_9137' not in raw and 'user_text' not in raw, raw   # 本文なし
+    assert oct(os.stat(ev).st_mode & 0o777) == '0o600', oct(os.stat(ev).st_mode)
+finally:
+    r.terminate(); up.shutdown()
+EOF"
+check "集計: 候補の抽出と起動時の1行" "python3 - <<'EOF'
+import json, os, subprocess, sys, tempfile
+d = tempfile.mkdtemp(); ev = os.path.join(d, 'events.jsonl')
+def e(ts, flags, n_tools=3, model='vibe-coder'):
+    return json.dumps({'ts': ts, 'model': model, 'n_tools': n_tools, 'flags': flags})
+rows = [e('2026-10-28T10:00:00', ['text_only', 'ends_with_question']),
+        e('2026-10-29T10:00:00', ['text_only', 'ends_with_question']),
+        e('2026-10-29T11:00:00', []), e('2026-10-29T12:00:00', []),
+        e('2026-10-29T13:00:00', ['asks_user_to_run']),
+        e('2026-10-20T10:00:00', ['asks_user_to_run']),           # 前の期間
+        'broken line']
+open(ev, 'w').write('\n'.join(rows) + '\n')
+run = lambda *a: subprocess.run([sys.executable, 'tools/vibe-kaizen.py', *a, '--events', ev,
+                                 '--now', '2026-10-30T00:00:00'], capture_output=True, text=True, check=True).stdout
+rep = run('report')
+assert '改善の候補（2 件）' in rep, rep                 # 質問で終わる2回 + 文章だけ率40%>20%
+cands = rep.split('## モデル別')[0]
+assert 'ends_with_question' in cands and 'text_only' in cands, rep
+assert 'asks_user_to_run' not in cands, rep                  # 今期は1回だけ → 候補外
+assert 'kaizen: 改善の候補が 2 件' in run('summary')
+assert '改善の候補が 1 件' in run('summary', '--min', '99')    # 率で見る text_only だけ残る
+open(ev, 'w').write('')
+assert run('summary') == '' and 'この期間の記録はありません' in run('report')
+EOF"
+
 echo "== 起動画面 =="
 check "スプラッシュ非TTYフォールバック" "bash -c 'VIBE_VERSION=t; eval \"\$(sed -n \"/^show_splash()/,/^}\$/p\" vibe-local.sh)\"; show_splash M m s c p | grep -c \"vibe-local\"'"
 

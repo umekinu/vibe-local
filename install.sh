@@ -1009,6 +1009,7 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/vibe-local.sh" ] && [ -f "${SCRIP
     cp "${SCRIPT_DIR}/themes/vibe-vaporwave.json" "$LIB_DIR/vibe-vaporwave.json"
     cp "${SCRIPT_DIR}/tools/debrand.py" "$LIB_DIR/debrand.py"
     cp "${SCRIPT_DIR}/tools/vibe-router.py" "$LIB_DIR/vibe-router.py"
+    cp "${SCRIPT_DIR}/tools/vibe-kaizen.py" "$LIB_DIR/vibe-kaizen.py"
     # 内蔵Pythonエンジン (--vibe-coder モード / RAG 用)
     [ -f "${SCRIPT_DIR}/vibe-coder.py" ] && cp "${SCRIPT_DIR}/vibe-coder.py" "$LIB_DIR/"
 else
@@ -1023,6 +1024,9 @@ else
     curl -fsSL "${REPO_RAW}/themes/vibe-vaporwave.json" -o "$LIB_DIR/vibe-vaporwave.json"
     curl -fsSL "${REPO_RAW}/tools/debrand.py" -o "$LIB_DIR/debrand.py"
     curl -fsSL "${REPO_RAW}/tools/vibe-router.py" -o "$LIB_DIR/vibe-router.py"
+    # kaizen集計 — 無くても TUI・ルーターは動くので致命的にしない
+    curl -fsSL "${REPO_RAW}/tools/vibe-kaizen.py" -o "$LIB_DIR/vibe-kaizen.py" || \
+        vapor_warn "vibe-kaizen.py のダウンロードに失敗 (--kaizen は使えません)"
     # 内蔵Pythonエンジン (--vibe-coder モード / RAG 用) — 失敗しても TUI は動くので致命的にしない
     curl -fsSL "${REPO_RAW}/vibe-coder.py" -o "$LIB_DIR/vibe-coder.py" || \
         vapor_warn "vibe-coder.py のダウンロードに失敗 (--vibe-coder モードは後で手動配置が必要)"

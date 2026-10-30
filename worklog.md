@@ -77,6 +77,18 @@
 - [x] **E2E実測: TUI挨拶 30秒→3.3秒 / コーディング初回 5.7秒**(router log: chat→vibe-fast, work-keyword→vibe-coder, title(pinned)→thinkingオフ)
 - 知見: `opencode run`ワンショットは並行プロセスやSIGKILL残骸でinitが不安定(TUIは無問題)。計測は必ずプロセス掃除してから。qwen3.5:4bはreasoning_effort:"none"(Ollama /v1)で思考オフにできる
 
+## kaizen 第1段階 (2026-10-30) — 学び続けるループの 検証→記録→抽出
+ROADMAPの失敗パターン(P0/P1)は「プロンプトに規則を足す」で直そうとして効果未確認のまま止まっていた。
+ループを閉じるため、まず失敗を自動で見つけて数える所まで作る (反映は第2段階、人が承認)。
+- [x] **検証**: vibe-router が /chat/completions の応答を素通ししながら写しを取り判定。対象はツールを渡したエージェント応答: text_only(P0-1, 率で見る) / ends_with_question(P0-2) / asks_user_to_run(P0-3) / simplified_zh(P1-4, 日本語の会話のみ) / empty_response / slow(>60s) / upstream_error / parse_error
+- [x] **記録**: `~/.local/state/vibe-local/kaizen/events.jsonl` (0600) に1応答1行。種類・件数・時間・モデルだけで **会話本文は残さない** (機密データを扱う環境で使うため)。`VIBE_LOCAL_NO_KAIZEN=1` で無効
+- [x] **抽出**: tools/vibe-kaizen.py — モデル×パターンの件数と率を前の期間と比較し候補に印 (2回以上 / 目標率超え / 悪化)。`vibe-local --kaizen` で表示、起動時は候補があれば1行だけ。何も書き換えない
+- [x] ルーターの sig に本体のチェックサムを追加 (ルーター更新時に旧デーモンが残らないように)
+- [x] テスト 17→22件 (判定ユニット・偽の上流でのE2E・本文が残らないこと・ファイル権限・集計)。わざと壊した4版で該当テストが落ちることを確認
+- [ ] 実機確認 (本物のモデルで数セッション → `--kaizen`)。text_only の目標20%はROADMAPの指標どおりだが、実データでうるさければ見直す
+- [ ] 第2段階: パターン台帳(patterns.json)・`kaizen promote`・反映(ルーターの仕組み優先/AGENTS.md)・格上げ後の再発と前後の率の自動比較
+- [ ] 第3段階: Ground-Truth TDD (答えのわかる課題の自己テストを同じ形で記録)
+
 ## 目玉機能候補（ブレスト統合済み、ユーザー選定待ち）
 - Tier1(プラグインで可): あんぜんゲート(permission.askフック) / 教室ダッシュボード(serve+SDK/SSE) / 刊=セッションzine化 / 偶発性オラクル(ochiai-v20)
 - Tier2(技術背骨): Ground-Truth TDDループ / Capability Probe / モデル固有失敗メモリ
