@@ -309,8 +309,8 @@ ensure_router() {
 
 # --- 初学者向けの共通指示 (OpenCodeのinstructionsとして読み込ませる) ---
 write_agents_md() {
-    [ -f "$AGENTS_FILE" ] && return 0
-    cat > "$AGENTS_FILE" <<'EOF'
+    if [ ! -f "$AGENTS_FILE" ]; then
+        cat > "$AGENTS_FILE" <<'EOF'
 # vibe-local 共通ルール
 
 - ユーザーが日本語で話したら日本語で、英語なら英語で答える。
@@ -318,6 +318,20 @@ write_agents_md() {
 - 破壊的なコマンド (rm, sudo, chmod, dd, --force など) を実行する前に、
   それが何をするのかを一行で説明してから実行の許可を求める。
 - コードを書いたら、実行方法を必ず最後に示す。
+EOF
+    fi
+    # 既存ファイル (ユーザー編集済みの可能性あり) は上書きせず、未追記の節だけ足す。
+    # 外部スキルは読み込まず (OPENCODE_DISABLE_*_SKILLS)、最小限の記法規約のみ持たせる。
+    grep -qF "## Obsidian 向けノートを作成する場合" "$AGENTS_FILE" 2>/dev/null && return 0
+    cat >> "$AGENTS_FILE" <<'EOF'
+
+## Obsidian 向けノートを作成する場合
+- 保存先の vault に既存の配置・命名・プロパティ規約があれば、それに従う。
+- vault 内のノートへのリンクは [[ノート名]]、表示名を変える場合は [[ノート名|表示名]] を使う。
+- 外部 URL は通常の Markdown リンクを使う。
+- 関連ノートは確認できたものを優先し、未作成リンクは意図がある場合に限る。
+- 自分の考察と引用・外部情報を区別し、外部情報には出典を添える。
+- 機密情報を含む出力は、公開・外部同期する vault への転記対象にしない。
 EOF
 }
 
