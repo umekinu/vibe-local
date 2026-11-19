@@ -107,6 +107,9 @@ vibe-local --attach http://192.168.x.x:4096
 
 # 環境診断
 vibe-local --doctor
+
+# 機密作業モード（Web取得・検索・MCP・プラグイン拒否、シェルは毎回確認）
+vibe-local --secure
 ```
 
 TUIの中では `/theme` でテーマ変更、`Tab` で Plan（相談）/ Build（実行）モード切替ができます。
@@ -492,6 +495,29 @@ vibe-local        # 毎回確認モード（推奨・既定）
 vibe-local -y     # 自動許可モード（上級者向け・自己責任）
 ```
 
+#### 機密作業モード `--secure`（初版: Mac/Linux の標準起動のみ）
+
+機密文書の要約・推敲や研究データの解析向けに、エージェントの権限を固定して起動します。
+
+| 項目 | 内容 |
+|---|---|
+| Web取得・Web検索・コード検索 | 全エージェントで **拒否** |
+| シェル実行・ファイル編集 | 全エージェントで **毎回確認** |
+| MCP サーバー / プラグイン | すべて無効（`--pure`、既定プラグインも無効） |
+| プロジェクト側の `opencode.json` / `.opencode/` | 読み込まない |
+| 指示 | `~/.config/vibe-local/SECURE.md`（生データを直接開かない・個票を出力しない・統計値は実行結果から転記 等） |
+
+- 起動のたびに OpenCode の**実効権限を全エージェントについて検証**し、1つでも外れていれば起動しません。
+  グローバル設定 (`~/.config/opencode`) のエージェント別上書きやカスタムエージェントも対象です。
+- 次の指定とは**併用できません**（起動前に拒否）: `--auto` / `--classic` / `--vibe-coder`（`--engine`）/
+  `--serve` / `--attach` / `-y`、プロジェクトのディレクトリ以外の追加引数、ループバック以外の `OLLAMA_HOST`。
+- ネットワーク接続（デフォルトルート）を検知すると警告し、続行の確認を求めます
+  （非対話では中止。続行させるには `VIBE_SECURE_ALLOW_ONLINE=1`）。判定は外部へ通信せずに行います。
+
+> **⚠️ `--secure` は外部通信を遮断しません。** 実行確認で承認したコマンドやスクリプトは通信できます。
+> 外部送信の防止が必須のデータは、Ollama（127.0.0.1）への接続を保ったまま外部通信を遮断できる環境
+> （Wi-Fi オフ、ファイアウォール等）で扱ってください。
+
 ### 🌱 やさしい にほんご
 
 > **⚠️ だいじな おしらせ：AIは まちがえることが あります！**
@@ -520,6 +546,12 @@ a `--force` flag, or anything you can't read — **reject it.**
 vibe-local        # Ask mode (recommended, default)
 vibe-local -y     # Auto-approve mode (advanced users only, at your own risk)
 ```
+
+`vibe-local --secure` (Mac/Linux, OpenCode + Ollama only) locks every agent to deny web fetch/search,
+disables MCP servers and plugins, ignores project config, and requires approval for every shell command.
+The effective permissions are verified at each launch (fails closed). **It does not block outbound
+network traffic** — approved commands can still reach the network, so handle data that must not leave
+the machine on a network-isolated host. See the Japanese section for details.
 
 ### 🇨🇳 中文
 

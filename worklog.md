@@ -88,3 +88,12 @@
 - 2026-07-12 14:2x: Ollama /v1/messages 実機OK。モデル3本pull開始（バックグラウンド）
 - 2026-07-12 14:3x: ユーザー決定: 名前はvibe-localのまま最新化。ochyaiCode改名は撤回
 - 2026-07-12 15:0x: v2実装完了（ランチャー/テーマ/installer/README/legacy/tests）。E2E・視覚検証通過
+
+## v2.3 (2026-11-19) — 機密作業モード `--secure` (初版: Mac/Linux 標準起動のみ)
+- [x] `--secure`: 併用不可 (--auto/--classic/--vibe-coder(--engine)/--serve/--attach/-y、ディレクトリ以外の追加引数、非ループバックOLLAMA_HOST) は ollama/opencode に触れる前に exit 2。理由は一括表示
+- [x] **tools/vibe-secure.py**: `opencode debug config` で解決済み agent/mcp を取得 → 全エージェント(組み込み7 + 設定由来)に bash/edit=ask, webfetch/websearch/codesearch=deny、全MCP enabled:false の OPENCODE_CONFIG_CONTENT を生成 → `opencode agent list` の実効ルール(後勝ち)を検証。外れ・エラーは起動拒否 (fail closed)
+- [x] env: OPENCODE_DISABLE_PROJECT_CONFIG / OPENCODE_PURE(+`--pure`) / DISABLE_DEFAULT_PLUGINS / DISABLE_LSP_DOWNLOAD / DISABLE_AUTOUPDATE、EXA系・OPENCODE_PERMISSION等をunset
+- [x] SECURE.md (毎回上書き) を instructions に追加。生データをツールで直接開かない・stdout/stderrに個票を出さない を追記
+- [x] 表示「🔒 SECURE (外部通信は遮断されません)」+ 起動時注意。デフォルトルート検知で確認 (非対話は中止、VIBE_SECURE_ALLOW_ONLINE=1 で続行)。判定は外部通信なし
+- [x] tests/test_secure.py 22件 (実物opencode 1.19.6 で敵対的グローバル/プロジェクト設定の統合テスト含む)、run.sh --ci 20/20
+- 知見 (opencode 1.19.6 実測): 合成順は グローバル → OPENCODE_CONFIG → プロジェクト → OPENCODE_CONFIG_CONTENT。ただし **agent.<name>.permission はトップレベル permission より後に評価** され、OPENCODE_PERMISSION / インラインのトップレベルでも上書きできない → 全エージェント個別に上書きが必要。文字列値はオブジェクト値(パターン別)を丸ごと置換。OPENCODE_DISABLE_PROJECT_CONFIG はプロジェクトの .opencode/agent も無効化。opencode.ai ドキュメントはこの環境から取得不可だったため、実バイナリの debug config / agent list で確認

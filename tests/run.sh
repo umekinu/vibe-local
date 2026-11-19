@@ -100,6 +100,11 @@ done
 kill \$RPID 2>/dev/null
 exit \$ok'"
 
+echo "== --secure (機密作業モード) =="
+check "vibe-secure.py 構文"           "python3 -m py_compile tools/vibe-secure.py"
+check "--help に --secure"            "./vibe-local.sh --help | grep -q -- '--secure'"
+check "--secure 一式 (併用拒否/権限ロック/fail closed; opencodeがあれば実物で統合テスト)" "python3 tests/test_secure.py"
+
 echo "== 起動画面 =="
 check "スプラッシュ非TTYフォールバック" "bash -c 'VIBE_VERSION=t; eval \"\$(sed -n \"/^show_splash()/,/^}\$/p\" vibe-local.sh)\"; show_splash M m s c p | grep -c \"vibe-local\"'"
 

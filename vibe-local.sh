@@ -20,6 +20,8 @@
 #   vibe-local --no-router        # 自動振り分けを切って大型モデル直結
 #   vibe-local --model TAG        # Ollamaモデル手動指定 (例: --model devstral)
 #   vibe-local -y                 # ツール自動許可 (上級者向け・自己責任)
+#   vibe-local --secure           # 機密作業モード: Web取得/検索・MCP・プラグインを拒否、
+#                                 #   シェルは毎回確認。外部通信そのものは遮断しない
 #   vibe-local --theme NAME       # テーマ切替 (null=黒灰 / vaporwave)
 #   vibe-local --classic          # Claude Code CLI をローカルLLMで使う (互換モード)
 #   vibe-local --vibe-coder ...    # 内蔵Pythonエンジン vibe-coder.py で起動 (RAG対応)
@@ -40,6 +42,8 @@ CONFIG_DIR="${HOME}/.config/vibe-local"
 CONFIG_FILE="${CONFIG_DIR}/v2.conf"            # v1/vibe-coder の config とは別ファイル (設定ドリフト対策)
 OPENCODE_CONFIG_FILE="${CONFIG_DIR}/opencode.json"
 AGENTS_FILE="${CONFIG_DIR}/AGENTS.md"
+SECURE_FILE="${CONFIG_DIR}/SECURE.md"
+SECURE_INLINE_FILE="${CONFIG_DIR}/secure-inline.json"
 STATE_DIR="${HOME}/.local/state/vibe-local"
 LIB_DIR="${HOME}/.local/lib/vibe-local"
 THEME_DIR="${HOME}/.config/opencode/themes"
@@ -321,16 +325,40 @@ write_agents_md() {
 EOF
 }
 
+# --- 機密作業モードの指示 (--secure 時のみ instructions に追加) ---
+# ポリシー文書なので AGENTS.md と違い毎回上書きする (改訂を確実に反映)。
+write_secure_md() {
+    cat > "$SECURE_FILE" <<'EOF'
+# 機密作業モード
+- 生データの中身をチャットに表示・引用しない。データはスクリプトに読ませ、
+  表示するのは列名・件数・要約統計・検定結果のみ。
+- 生データのファイルをエージェントのツール (read 等) で直接開かない。
+  解析スクリプトの標準出力・標準エラーにも個票 (個々の行・レコード) を出さない。
+  ツールの出力はそのままモデルに渡るため、チャットに引用しなくても生データが渡ってしまう。
+- 統計値（p値・効果量・信頼区間）は必ずスクリプトの実行結果から転記する。
+  推測や暗算で数値を書かない。APA7形式で報告する。
+- 解析は再現可能なスクリプト(.py/.R)としてファイルに保存してから実行する。
+- 外部への通信（curl, wget, pip install, git push 等）を提案・実行しない。
+- 文書の修正は元ファイルを上書きせず、別名で保存し差分を示す。
+EOF
+}
+
 # --- OpenCode 設定生成 ---
 # use_router=1 のとき baseURL をルーターに向け、既定モデルを vibe-auto にする。
 # vibe-auto = ルーターが内容を見て main/small に自動振り分けする仮想モデル。
 write_opencode_config() {
-    local main_model="$1" small_model="$2" main_ctx="$3" perm="$4" use_router="${5:-0}"
-    local perm_json base_url default_model auto_entry=""
-    if [ "$perm" = "allow" ]; then
+    local main_model="$1" small_model="$2" main_ctx="$3" perm="$4" use_router="${5:-0}" secure="${6:-0}"
+    local perm_json base_url default_model auto_entry="" instructions_json
+    if [ "$secure" = "1" ]; then
+        # 多層防御: 実効値は vibe-secure.py のインライン設定で全エージェントに強制・検証する
+        perm_json='{ "edit": "ask", "bash": "ask", "webfetch": "deny", "websearch": "deny", "codesearch": "deny" }'
+        instructions_json="[\"${AGENTS_FILE}\", \"${SECURE_FILE}\"]"
+    elif [ "$perm" = "allow" ]; then
         perm_json='{ "edit": "allow", "bash": "allow", "webfetch": "allow" }'
+        instructions_json="[\"${AGENTS_FILE}\"]"
     else
         perm_json='{ "edit": "ask", "bash": "ask", "webfetch": "ask" }'
+        instructions_json="[\"${AGENTS_FILE}\"]"
     fi
     if [ "$use_router" = "1" ]; then
         base_url="http://127.0.0.1:${ROUTER_PORT}/v1"
@@ -349,7 +377,7 @@ write_opencode_config() {
   "\$schema": "https://opencode.ai/config.json",
   "model": "ollama/${default_model}",
   "small_model": "ollama/${small_model}",
-  "instructions": ["${AGENTS_FILE}"],
+  "instructions": ${instructions_json},
   "autoupdate": false,
   "share": "disabled",
   "permission": ${perm_json},
@@ -372,6 +400,109 @@ write_opencode_config() {
   }
 }
 EOF
+}
+
+# --- 機密作業モード (--secure) ---
+# 初版は Mac/Linux の標準起動 (OpenCode + Ollama) 専用。
+# 制限を保証できない起動経路は、起動前に拒否する (fail closed)。
+is_loopback_url() {
+    local h="${1#*://}"
+    h="${h%%/*}"
+    case "$h" in
+        \[*\]*) h="${h#[}"; h="${h%%]*}" ;;   # [::1]:11434 → ::1
+        *:*:*) ;;                                # 素の IPv6
+        *) h="${h%%:*}" ;;                       # host:port → host
+    esac
+    case "$h" in
+        localhost|::1) return 0 ;;
+    esac
+    [[ "$h" =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && return 0
+    return 1
+}
+
+secure_validate() {
+    local bad=() a positional=0
+    [ "$AUTO_MODE" -eq 1 ]  && bad+=("--auto        : オンライン時にクラウド (Claude Code) へ切り替わるため")
+    [ "$CLASSIC" -eq 1 ]    && bad+=("--classic     : 別エンジン (Claude Code CLI) では制限が効かないため")
+    [ "$VIBE_CODER" -eq 1 ] && bad+=("--vibe-coder / --engine : 別エンジン (vibe-coder.py) では制限が効かないため")
+    [ "$SERVE" -eq 1 ]      && bad+=("--serve       : LAN にサーバーを公開するため")
+    [ -n "$ATTACH_URL" ]    && bad+=("--attach      : 他マシンのサーバー上で実行されるため")
+    [ "$YES_FLAG" -eq 1 ]   && bad+=("-y / --yes    : シェル実行の毎回確認を外すため")
+    # OpenCode へ素通しする引数は、プロジェクトのディレクトリ1つだけ許可
+    # (serve / web / --hostname 等で別経路の起動をさせない)
+    for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+        if [ "${a#-}" = "$a" ] && [ -d "$a" ] && [ "$positional" -eq 0 ]; then
+            positional=1
+        else
+            bad+=("追加引数 '${a}' : --secure ではプロジェクトのディレクトリ指定以外を受け付けません")
+        fi
+    done
+    if ! is_loopback_url "$OLLAMA_HOST"; then
+        bad+=("OLLAMA_HOST=${OLLAMA_HOST} : ループバック以外の Ollama にはデータがネットワーク経由で渡るため")
+    fi
+    if [ "${#bad[@]}" -gt 0 ]; then
+        echo "❌ --secure と併用できない指定があります。起動を中止しました。" >&2
+        for a in "${bad[@]}"; do echo "   - $a" >&2; done
+        return 1
+    fi
+    return 0
+}
+
+# 外部へパケットを出さずに「ネットにつながっていそうか」を判定する (デフォルトルートの有無)。
+# 判定できない環境では「つながっている」とみなす (安全側)。
+has_default_route() {
+    if [ "$(uname -s)" = "Darwin" ] && command -v route &>/dev/null; then
+        route -n get default &>/dev/null && return 0
+        route -n get -inet6 default &>/dev/null && return 0
+        return 1
+    fi
+    if command -v ip &>/dev/null; then
+        [ -n "$(ip route show default 2>/dev/null)" ] && return 0
+        [ -n "$(ip -6 route show default 2>/dev/null)" ] && return 0
+        return 1
+    fi
+    return 0
+}
+
+secure_network_gate() {
+    has_default_route || return 0
+    echo "⚠️  ネットワークに接続されているようです (デフォルトルートあり)。" >&2
+    echo "   --secure は外部通信を遮断しません。承認したシェルコマンドやスクリプトは通信できます。" >&2
+    echo "   外部送信の防止が必須のデータは、Wi-Fi を切るなど外部通信を遮断した状態で扱ってください。" >&2
+    if [ "${VIBE_SECURE_ALLOW_ONLINE:-0}" = "1" ]; then
+        echo "   (VIBE_SECURE_ALLOW_ONLINE=1 のため続行します)" >&2
+        return 0
+    fi
+    if [ -r /dev/tty ] && [ -t 0 ]; then
+        local ans=""
+        printf "   このまま続行しますか？ [y/N] " >&2
+        read -r ans < /dev/tty || ans=""
+        case "$ans" in y|Y|yes|YES) return 0 ;; esac
+        echo "中止しました。" >&2
+        return 1
+    fi
+    echo "   非対話実行のため中止しました (続行するには VIBE_SECURE_ALLOW_ONLINE=1)。" >&2
+    return 1
+}
+
+# OpenCode の実効権限を全エージェントに強制し、検証できたときだけ成功する
+secure_prepare() {
+    local script="" c
+    for c in "${SCRIPT_DIR}/tools/vibe-secure.py" "${LIB_DIR}/vibe-secure.py"; do
+        [ -f "$c" ] && script="$c" && break
+    done
+    if [ -z "$script" ] || ! command -v python3 &>/dev/null; then
+        echo "❌ vibe-secure.py (または python3) が見つかりません。--secure で起動できません。" >&2
+        return 1
+    fi
+    rm -f "$SECURE_INLINE_FILE"
+    if ! python3 "$script" prepare --opencode "$OPENCODE_BIN" --out "$SECURE_INLINE_FILE"; then
+        echo "❌ 権限ロックを検証できなかったため、起動を中止しました。" >&2
+        return 1
+    fi
+    OPENCODE_CONFIG_CONTENT="$(cat "$SECURE_INLINE_FILE")"
+    export OPENCODE_CONFIG_CONTENT
+    return 0
 }
 
 # --- ネットワーク接続チェック ---
@@ -609,6 +740,7 @@ PRINT_CONFIG=0
 REBUILD=0
 THEME_OVERRIDE=""
 NO_ROUTER=0
+SECURE=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -618,6 +750,7 @@ while [[ $# -gt 0 ]]; do
         --fast)     FAST_MODE=1; shift ;;
         --no-router) NO_ROUTER=1; shift ;;
         -y|--yes)   YES_FLAG=1; shift ;;
+        --secure)   SECURE=1; shift ;;
         --theme)    THEME_OVERRIDE="$2"; shift 2 ;;
         --classic)  CLASSIC=1; shift ;;
         --vibe-coder|--engine) VIBE_CODER=1; shift ;;
@@ -638,6 +771,11 @@ case "$THEME_OVERRIDE" in
     null|mono|dark)  THEME_OVERRIDE="vibe-null" ;;
     vaporwave|vapor) THEME_OVERRIDE="vibe-vaporwave" ;;
 esac
+
+if [ "$SECURE" -eq 1 ]; then
+    secure_validate || exit 2
+    secure_network_gate || exit 2
+fi
 
 apply_model_matrix
 
@@ -711,6 +849,10 @@ if [ "$YES_FLAG" -eq 1 ]; then
     PERM="allow"
     PERM_LABEL="ツール自動許可 (自己責任)"
 fi
+if [ "$SECURE" -eq 1 ]; then
+    PERM="ask"
+    PERM_LABEL="🔒 SECURE (外部通信は遮断されません)"
+fi
 
 # --- classic モード: Claude Code CLI + Ollama ネイティブ /v1/messages ---
 if [ "$CLASSIC" -eq 1 ]; then
@@ -757,6 +899,7 @@ fi
 command -v opencode &>/dev/null || { echo "❌ opencode が未インストールです (brew install opencode)"; exit 1; }
 install_theme
 write_agents_md
+[ "$SECURE" -eq 1 ] && write_secure_md
 
 # ルーター起動 (雑談→小型 / コーディング→大型 の自動振り分け)。
 # モデルが1本の時 (--fast や16GB機) も小型モデルのthinking無効化のために通す
@@ -765,7 +908,7 @@ if [ "$NO_ROUTER" -eq 0 ]; then
     ensure_router && USE_ROUTER=1
 fi
 
-write_opencode_config "$MAIN_ALIAS" "$SMALL_ALIAS" "$NUM_CTX" "$PERM" "$USE_ROUTER"
+write_opencode_config "$MAIN_ALIAS" "$SMALL_ALIAS" "$NUM_CTX" "$PERM" "$USE_ROUTER" "$SECURE"
 
 if [ "$PRINT_CONFIG" -eq 1 ]; then
     cat "$OPENCODE_CONFIG_FILE"
@@ -783,6 +926,21 @@ export OPENCODE_DISABLE_TERMINAL_TITLE=1
 export OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1
 export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
 export OPENCODE_DISABLE_MODELS_FETCH=1
+
+PURE_ARGS=()
+if [ "$SECURE" -eq 1 ]; then
+    # プロジェクト側の opencode.json / .opencode/ を読まない、外部・既定プラグインを読まない、
+    # LSP の自動ダウンロード・自動更新・Web検索プロバイダを使わない
+    export OPENCODE_DISABLE_PROJECT_CONFIG=1
+    export OPENCODE_PURE=1
+    export OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+    export OPENCODE_DISABLE_LSP_DOWNLOAD=1
+    export OPENCODE_DISABLE_AUTOUPDATE=1
+    unset OPENCODE_PERMISSION OPENCODE_ENABLE_EXA OPENCODE_EXPERIMENTAL_EXA OPENCODE_WEBSEARCH_PROVIDER \
+          OPENCODE_AUTO_SHARE OPENCODE_CONFIG_DIR 2>/dev/null || true
+    PURE_ARGS=(--pure)
+    secure_prepare || exit 2
+fi
 [ -t 1 ] && printf '\033]0;vibe-local\007'   # タイトルは vibe-local に
 
 # --- 教室モード: serve (先生側) ---
@@ -802,11 +960,20 @@ fi
 # --- 起動 ---
 if [ -n "$PROMPT" ]; then
     # ワンショットは演出なしで即実行
-    exec "$OPENCODE_BIN" run "$PROMPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+    [ "$SECURE" -eq 1 ] && echo "🔒 SECURE: Web取得/検索・MCP・プラグイン拒否、シェルは毎回確認。外部通信は遮断されません。" >&2
+    exec "$OPENCODE_BIN" ${PURE_ARGS[@]+"${PURE_ARGS[@]}"} run "$PROMPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
 
 MODE_LABEL="vibe TUI"
 [ "$FAST_MODE" -eq 1 ] && MODE_LABEL="vibe TUI (fast)"
+[ "$SECURE" -eq 1 ] && MODE_LABEL="${MODE_LABEL} 🔒 SECURE"
 show_splash "$MODE_LABEL" "${MAIN_ALIAS} (${BASE_MODEL})" "$SMALL_ALIAS" "${NUM_CTX} tok" "$PERM_LABEL"
+if [ "$SECURE" -eq 1 ]; then
+    echo " 🔒 SECURE: Web取得・Web検索・MCP・プラグインを拒否 / シェルは毎回確認"
+    echo "    ⚠️  外部通信は遮断されません。承認したコマンドやスクリプトは通信できます。"
+    echo "    外部送信の防止が必須のデータは、Ollama (127.0.0.1) への接続を保ったまま"
+    echo "    外部通信を遮断した環境 (Wi-Fiオフ等) で扱ってください。"
+    echo ""
+fi
 
-exec "$OPENCODE_BIN" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+exec "$OPENCODE_BIN" ${PURE_ARGS[@]+"${PURE_ARGS[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
