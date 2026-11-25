@@ -4661,10 +4661,16 @@ class GoalLoop:
         self.progress_path = os.path.join(cwd, ".vibe", "progress.md")
 
     # ── Verification ──────────────────────────────────────────────────────────
-    def verify(self):
-        """Run the verification command. Returns (passed, exit_code, output)."""
+    def verify(self, round_no=0):
+        """Run the verification command. Returns (passed, exit_code, output).
+
+        The harness-run verify gets VIBE_GOAL_ROUND=<round> in its environment;
+        the model running the same command via Bash does not. Verify commands
+        should be idempotent (the model is told to run them too)."""
+        env = os.environ.copy()
+        env["VIBE_GOAL_ROUND"] = str(round_no)
         popen_kwargs = dict(shell=True, cwd=self.cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         try:
@@ -4791,7 +4797,7 @@ class GoalLoop:
                 printer(f"{y}◎ Goal loop stopped by user (round {round_no}).{rst}")
                 return {"status": "interrupted", "rounds": round_no}
             printer(f"\n{d}◎ Verifying (round {round_no}/{self.max_rounds}): {self.verify_cmd}{rst}")
-            passed, code, output = self.verify()
+            passed, code, output = self.verify(round_no)
             sig = None if passed else self.failure_signature(code, output)
             self.append_progress(round_no, passed, code, output, sig, task)
             if passed:

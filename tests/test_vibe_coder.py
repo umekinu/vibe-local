@@ -10410,6 +10410,19 @@ class TestGoalLoop:
         prompt = vc.GoalLoop("test -f x", str(tmp_path)).build_initial_prompt("create x")
         assert vc.Agent._detect_parallel_tasks(prompt)
 
+    def test_verify_gets_round_env(self, tmp_path):
+        ok, _, out = vc.GoalLoop('echo "r=$VIBE_GOAL_ROUND"', str(tmp_path)).verify(3)
+        assert ok and "r=3" in out
+
+    def test_round_env_makes_retry_deterministic(self, tmp_path):
+        # Even if the model runs the verify command itself, it fails until round 2.
+        agent = _FakeAgent()
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || { echo "fail until round 2"; exit 1; }',
+                         str(tmp_path))
+        res = gl.run(agent, "task", printer=_quiet)
+        assert res == {"status": "passed", "rounds": 2}
+        assert "fail until round 2" in agent.prompts[1]
+
     def test_config_goal_args(self):
         cfg = vc.Config()
         cfg._load_cli_args(["-p", "x", "--goal", "pytest -q", "--goal-max-rounds", "7",
