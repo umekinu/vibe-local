@@ -10617,3 +10617,92 @@ class TestSelfVerifyCut:
         assert all(w["fails"] == 0 and w["limit"] == vc.GoalLoop.SELF_VERIFY_LIMIT for w in seen)
         assert "previous round was stopped" in agent.prompts[1]
         assert agent.goal_watch is None  # cleared after the loop
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Goal loop: anti-gaming (tamper block, disagreement, protected memory)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGoalAntiGaming:
+
+    def _agent(self, tmp_path):
+        a = vc.Agent.__new__(vc.Agent)
+        a.tracer = vc.Tracer(str(tmp_path))
+        a.goal_watch = {"cmd": "pytest -q", "fails": 0, "runs": 0, "limit": 3,
+                        "tamper": 0, "last_self_ok": None}
+        return a
+
+    @pytest.mark.parametrize("cmd", [
+        "export VIBE_GOAL_ROUND=2 && pytest -q",
+        "VIBE_GOAL_ROUND=5 pytest -q",
+        "env VIBE_GOAL_ROUND = 2 sh -c x",
+        "cd /x && export VIBE_GOAL_ROUND=2",
+    ])
+    def test_tamper_detected(self, tmp_path, cmd):
+        assert self._agent(tmp_path)._is_goal_tamper("Bash", {"command": cmd})
+
+    @pytest.mark.parametrize("cmd", [
+        "echo $VIBE_GOAL_ROUND",
+        'env | grep -i vibe',
+        '[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ]',
+        "MY_VIBE_GOAL_ROUND_X=1 true",
+    ])
+    def test_reading_is_not_tamper(self, tmp_path, cmd):
+        assert not self._agent(tmp_path)._is_goal_tamper("Bash", {"command": cmd})
+
+    def test_tamper_only_during_goal_loop(self, tmp_path):
+        a = self._agent(tmp_path)
+        a.goal_watch = None
+        assert not a._is_goal_tamper("Bash", {"command": "export VIBE_GOAL_ROUND=2"})
+
+    def test_last_self_ok_tracked(self, tmp_path):
+        a = self._agent(tmp_path)
+        a._goal_watch_update("Bash", {"command": "pytest -q"}, "1 failed\n(exit code: 1)")
+        assert a.goal_watch["last_self_ok"] is False
+        a._goal_watch_update("Bash", {"command": "pytest -q"}, "1 passed")
+        assert a.goal_watch["last_self_ok"] is True
+
+    def test_disagreement_reported_in_feedback_and_trace(self, tmp_path):
+        def on_run(agent, n):
+            if n == 1:  # model claims its own check passed (e.g. after gaming the env)
+                agent.goal_watch["runs"] = 1
+                agent.goal_watch["last_self_ok"] = True
+                agent.goal_watch["tamper"] = 2
+
+        agent = _FakeAgent(on_run)
+        agent.tracer = vc.Tracer(str(tmp_path))
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || exit 1', str(tmp_path))
+        res = gl.run(agent, "t", printer=_quiet)
+        assert res["status"] == "passed"
+        fb = agent.prompts[1]
+        assert "passed, but the harness's verification failed" in fb
+        assert "tried 2 time(s) to set the harness-only variable" in fb
+        r1 = [e for e in vc.Tracer.load(agent.tracer.path) if e["ev"] == "goal_round"][0]
+        assert r1["disagree"] is True and r1["tamper"] == 2 and r1["self_runs"] == 1
+        out = vc.Tracer.summarize(vc.Tracer.last_units(vc.Tracer.load(agent.tracer.path))[0]
+                                  + [{"ev": "tool", "name": "Bash", "arg": "x", "tamper": True, "ok": False}])
+        assert "Gaming signals: 1 blocked VIBE_GOAL_ROUND attempt(s), 1 round(s)" in out
+
+    def test_no_disagreement_when_model_check_failed(self, tmp_path):
+        def on_run(agent, n):
+            agent.goal_watch["last_self_ok"] = False
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || exit 1', str(tmp_path))
+        gl.run(agent, "t", printer=_quiet)
+        assert "harness's verification failed" not in agent.prompts[1]
+
+    @pytest.mark.parametrize("name", ["progress.md", "trace.jsonl", "trace.jsonl.1"])
+    def test_vibe_memory_files_protected(self, tmp_path, name):
+        assert vc._is_protected_path(str(tmp_path / ".vibe" / name))
+
+    def test_same_names_elsewhere_not_protected(self, tmp_path):
+        assert not vc._is_protected_path(str(tmp_path / "progress.md"))
+        assert not vc._is_protected_path(str(tmp_path / "docs" / "trace.jsonl"))
+
+    def test_write_tool_refuses_progress_md(self, tmp_path):
+        target = tmp_path / ".vibe" / "progress.md"
+        target.parent.mkdir()
+        target.write_text("real history")
+        out = vc.WriteTool().execute({"file_path": str(target), "content": "fake history"})
+        assert out.startswith("Error:")
+        assert target.read_text() == "real history"
