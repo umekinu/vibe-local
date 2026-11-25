@@ -2758,6 +2758,9 @@ class ReadTool(Tool):
         return result
 
 
+_PROTECTED_VIBE_FILES = {"progress.md", "trace.jsonl", "trace.jsonl.1"}
+
+
 def _is_protected_path(file_path):
     """Check if a file path points to a protected config/permission file."""
     _PROTECTED_BASENAMES = {"permissions.json", ".vibe-coder.json"}
@@ -2765,6 +2768,10 @@ def _is_protected_path(file_path):
         real = os.path.realpath(file_path)
         basename = os.path.basename(real)
         if basename in _PROTECTED_BASENAMES:
+            return True
+        # Goal-loop memory and trace log: the model must not rewrite its own history
+        if (basename in _PROTECTED_VIBE_FILES
+                and os.path.basename(os.path.dirname(real)) == ".vibe"):
             return True
         # Check both vibe-local and legacy vibe-coder config directories
         for dirname in ("vibe-local", "vibe-coder"):
@@ -4778,6 +4785,11 @@ class Tracer:
                        if e.get("ev") == "run_end" and e.get("status") == "self_verify_limit")
             cut_txt = f", {cuts} round(s) cut" if cuts else ""
             lines.append(f"  Self-verify by model: {len(sv)} run(s) ({sv_fail} failed{cut_txt})")
+        tamper = [t for t in tools if t.get("tamper")]
+        disagree = [e for e in rounds if e.get("disagree")]
+        if tamper or disagree:
+            lines.append(f"  ⚠ Gaming signals: {len(tamper)} blocked VIBE_GOAL_ROUND attempt(s), "
+                         f"{len(disagree)} round(s) where model's check passed but harness failed")
 
         by_name = collections.Counter(t.get("name", "?") for t in tools)
         if by_name:
@@ -4962,7 +4974,8 @@ class GoalLoop:
             parts += history
         return "\n".join(parts)
 
-    def build_feedback_prompt(self, round_no, exit_code, output, repeated, cut=False):
+    def build_feedback_prompt(self, round_no, exit_code, output, repeated, cut=False,
+                              disagree=False, tamper=0):
         lines = [
             f"[GOAL NOT MET — round {round_no}/{self.max_rounds}] "
             f"`{self.verify_cmd}` exited with status {exit_code}.",
@@ -4972,6 +4985,13 @@ class GoalLoop:
             "```",
             "Find the root cause and fix it, then run the command again to confirm.",
         ]
+        if disagree:
+            lines.append(f"WARNING: your own last run of `{self.verify_cmd}` passed, but the harness's "
+                         "verification failed. A check that passes only in your environment does not count. "
+                         "Do not alter the environment, the check, or the test files — fix the actual code.")
+        if tamper:
+            lines.append(f"WARNING: you tried {tamper} time(s) to set the harness-only variable "
+                         "VIBE_GOAL_ROUND. Those commands were blocked.")
         if cut:
             lines.append(f"NOTE: the previous round was stopped because your own runs of `{self.verify_cmd}` "
                          f"failed {self.SELF_VERIFY_LIMIT} times. Re-running the check does not fix it — "
@@ -5010,8 +5030,9 @@ class GoalLoop:
             return {"status": status, "rounds": rounds}
 
         for round_no in range(1, self.max_rounds + 1):
-            agent.goal_watch = {"cmd": self.verify_cmd, "fails": 0, "runs": 0,
-                                "limit": self.SELF_VERIFY_LIMIT}
+            watch = {"cmd": self.verify_cmd, "fails": 0, "runs": 0,
+                     "limit": self.SELF_VERIFY_LIMIT, "tamper": 0, "last_self_ok": None}
+            agent.goal_watch = watch
             agent.run(prompt, auto_parallel=False)
             cut = getattr(agent, "last_run_status", None) == "self_verify_limit"
             if agent._interrupted.is_set():
@@ -5021,9 +5042,15 @@ class GoalLoop:
             _v0 = time.time()
             passed, code, output = self.verify(round_no)
             sig = None if passed else self.failure_signature(code, output)
+            # Model's own last check passed but the harness's failed → likely gamed
+            disagree = (not passed) and watch.get("last_self_ok") is True
             if tracer is not None:
                 tracer.emit("goal_round", round=round_no, passed=passed, exit=code, sig=sig,
-                            verify_ms=int((time.time() - _v0) * 1000))
+                            verify_ms=int((time.time() - _v0) * 1000),
+                            self_runs=watch["runs"], tamper=watch.get("tamper", 0),
+                            disagree=disagree)
+            if disagree:
+                printer(f"{y}◎ Your own check passed but the harness's verification failed.{rst}")
             self.append_progress(round_no, passed, code, output, sig, task)
             if passed:
                 printer(f"{g}◎ Goal met in {round_no} round(s).{rst}")
@@ -5040,7 +5067,8 @@ class GoalLoop:
             if round_no == self.max_rounds:
                 break
             prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2,
-                                                cut=cut)
+                                                cut=cut, disagree=disagree,
+                                                tamper=watch.get("tamper", 0))
         printer(f"{y}◎ Goal not met after {self.max_rounds} rounds. See .vibe/progress.md.{rst}")
         return _end("max_rounds", self.max_rounds)
 
@@ -7459,6 +7487,20 @@ class Agent:
                             results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
                             self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
                             continue
+                    # Goal loop: VIBE_GOAL_ROUND is harness-only — refuse attempts to set it
+                    if self._is_goal_tamper(tool_name, tool_params):
+                        gw = self.goal_watch
+                        gw["tamper"] = gw.get("tamper", 0) + 1
+                        gw["fails"] += 1  # counts toward the per-round self-verify limit
+                        msg = ("Error: VIBE_GOAL_ROUND is set only by the harness's verification run. "
+                               "Setting it yourself is not allowed and does not satisfy the goal — "
+                               "fix the code instead.")
+                        results.append(ToolResult(tc_id, msg, True))
+                        self._trace_tool(tool_name, tool_params, 0, True, msg)
+                        self.tui.show_tool_result(tool_name, "Blocked: harness-only variable", True)
+                        if gw["fails"] >= gw["limit"]:
+                            _self_verify_stop = True
+                        continue
                     # Then ask permission
                     if not self.permissions.check(tool_name, tool_params, self.tui):
                         results.append(ToolResult(tc_id, "Permission denied by user. Do not retry this operation.", True))
@@ -7717,6 +7759,15 @@ class Agent:
         norm = lambda x: re.sub(r"\s+", " ", x).strip()
         return norm(gw["cmd"]) in norm(cmd)
 
+    _GOAL_TAMPER_RE = re.compile(r"\bVIBE_GOAL_ROUND\s*=")
+
+    def _is_goal_tamper(self, name, params):
+        """True if a Bash call tries to set the harness-only VIBE_GOAL_ROUND."""
+        if not getattr(self, "goal_watch", None) or name != "Bash" or not isinstance(params, dict):
+            return False
+        cmd = params.get("command")
+        return isinstance(cmd, str) and self._GOAL_TAMPER_RE.search(cmd) is not None
+
     def _goal_watch_update(self, name, params, output):
         """Count the model's own verify runs; return True when the per-round
         failure limit is reached (the round should end and hand over to the
@@ -7725,7 +7776,9 @@ class Agent:
             return False
         gw = self.goal_watch
         gw["runs"] += 1
-        if self._bash_failed(output):
+        failed = self._bash_failed(output)
+        gw["last_self_ok"] = not failed
+        if failed:
             gw["fails"] += 1
         return gw["fails"] >= gw["limit"]
 
@@ -7743,6 +7796,8 @@ class Agent:
                 fields["ok"] = False
         if self._is_self_verify(name, params):
             fields["self_verify"] = True
+        if self._is_goal_tamper(name, params):
+            fields["tamper"] = True
         if not fields["ok"] and isinstance(output, str):
             fields["err"] = re.sub(r"\s+", " ", output)[:160]
         self.tracer.emit("tool", **fields)
