@@ -725,6 +725,7 @@ class Config:
         self.goal = None            # verification command
         self.goal_max_rounds = 5
         self.goal_timeout = 300     # seconds per verification run
+        self.goal_round_steps = 12  # max LLM steps per goal round before handing to verification
         # Trace log (.vibe/trace.jsonl) — metadata only; disable with --no-trace / VIBE_TRACE=0
         self.trace_summary = None   # --trace-summary N: print last N runs and exit
         self.trace = os.environ.get("VIBE_TRACE", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -879,6 +880,8 @@ class Config:
                             help="Max agent rounds for --goal (default: 5)")
         parser.add_argument("--goal-timeout", type=int, default=None,
                             help="Timeout in seconds for each verify run (default: 300)")
+        parser.add_argument("--goal-round-steps", type=int, default=None,
+                            help="Max agent steps per goal round before verifying (default: 12)")
         parser.add_argument("--no-trace", action="store_true",
                             help="Do not write .vibe/trace.jsonl")
         parser.add_argument("--trace-summary", type=int, nargs="?", const=1, default=None, metavar="N",
@@ -919,6 +922,8 @@ class Config:
             self.goal_max_rounds = args.goal_max_rounds
         if args.goal_timeout is not None:
             self.goal_timeout = args.goal_timeout
+        if args.goal_round_steps is not None:
+            self.goal_round_steps = args.goal_round_steps
         if args.rag:
             self.rag = True
         if args.rag_mode:
@@ -4852,7 +4857,9 @@ class GoalLoop:
     HISTORY_ENTRIES = 5        # past entries injected from progress.md
     PROGRESS_EXCERPT = 800     # chars of verifier output stored per entry
 
-    def __init__(self, verify_cmd, cwd, max_rounds=None, timeout=300):
+    DEFAULT_ROUND_STEPS = 12
+
+    def __init__(self, verify_cmd, cwd, max_rounds=None, timeout=300, round_steps=None):
         verify_cmd = (verify_cmd or "").strip()
         if not verify_cmd:
             raise ValueError("verify command must not be empty")
@@ -4864,6 +4871,11 @@ class GoalLoop:
             mr = self.DEFAULT_MAX_ROUNDS
         self.max_rounds = max(1, min(mr, self.HARD_MAX_ROUNDS))
         self.timeout = max(1, int(timeout))
+        try:
+            rs = int(round_steps) if round_steps is not None else self.DEFAULT_ROUND_STEPS
+        except (TypeError, ValueError):
+            rs = self.DEFAULT_ROUND_STEPS
+        self.round_steps = max(1, rs)
         self.progress_path = os.path.join(cwd, ".vibe", "progress.md")
 
     # ── Verification ──────────────────────────────────────────────────────────
@@ -4975,7 +4987,7 @@ class GoalLoop:
         return "\n".join(parts)
 
     def build_feedback_prompt(self, round_no, exit_code, output, repeated, cut=False,
-                              disagree=False, tamper=0):
+                              disagree=False, tamper=0, step_cut=False):
         lines = [
             f"[GOAL NOT MET — round {round_no}/{self.max_rounds}] "
             f"`{self.verify_cmd}` exited with status {exit_code}.",
@@ -4992,6 +5004,10 @@ class GoalLoop:
         if tamper:
             lines.append(f"WARNING: you tried {tamper} time(s) to set the harness-only variable "
                          "VIBE_GOAL_ROUND. Those commands were blocked.")
+        if step_cut:
+            lines.append(f"NOTE: the previous round hit its step limit ({self.round_steps}) without "
+                         "fixing the problem. Be direct: read the failing code, make the change, run the "
+                         "check once. Do not use echo to think out loud, and do not probe the harness.")
         if cut:
             lines.append(f"NOTE: the previous round was stopped because your own runs of `{self.verify_cmd}` "
                          f"failed {self.SELF_VERIFY_LIMIT} times. Re-running the check does not fix it — "
@@ -5006,12 +5022,14 @@ class GoalLoop:
         """Run the goal loop. Returns dict(status=..., rounds=int).
         status: 'passed' | 'max_rounds' | 'no_progress' | 'interrupted'"""
         y, g, r, d, rst = C.YELLOW, C.GREEN, C.RED, C.DIM, C.RESET
-        printer(f"\n{y}◎ Goal:{rst} `{self.verify_cmd}` exits 0  {d}(max {self.max_rounds} rounds){rst}")
+        printer(f"\n{y}◎ Goal:{rst} `{self.verify_cmd}` exits 0  "
+                f"{d}(max {self.max_rounds} rounds × {self.round_steps} steps){rst}")
         prompt = self.build_initial_prompt(task)
         tracer = getattr(agent, "tracer", None)
         if tracer is not None:
             tracer.group = "g" + uuid.uuid4().hex[:7]
-            tracer.emit("goal_start", cmd=self.verify_cmd, max_rounds=self.max_rounds)
+            tracer.emit("goal_start", cmd=self.verify_cmd, max_rounds=self.max_rounds,
+                        round_steps=self.round_steps)
         try:
             return self._run_rounds(agent, task, prompt, printer, tracer)
         finally:
@@ -5033,8 +5051,10 @@ class GoalLoop:
             watch = {"cmd": self.verify_cmd, "fails": 0, "runs": 0,
                      "limit": self.SELF_VERIFY_LIMIT, "tamper": 0, "last_self_ok": None}
             agent.goal_watch = watch
-            agent.run(prompt, auto_parallel=False)
-            cut = getattr(agent, "last_run_status", None) == "self_verify_limit"
+            agent.run(prompt, auto_parallel=False, max_steps=self.round_steps)
+            _st = getattr(agent, "last_run_status", None)
+            cut = _st == "self_verify_limit"
+            step_cut = _st == "round_step_limit"
             if agent._interrupted.is_set():
                 printer(f"{y}◎ Goal loop stopped by user (round {round_no}).{rst}")
                 return _end("interrupted", round_no)
@@ -5068,7 +5088,7 @@ class GoalLoop:
                 break
             prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2,
                                                 cut=cut, disagree=disagree,
-                                                tamper=watch.get("tamper", 0))
+                                                tamper=watch.get("tamper", 0), step_cut=step_cut)
         printer(f"{y}◎ Goal not met after {self.max_rounds} rounds. See .vibe/progress.md.{rst}")
         return _end("max_rounds", self.max_rounds)
 
@@ -7218,8 +7238,11 @@ class Agent:
                 return tasks
         return []
 
-    def run(self, user_input, auto_parallel=True):
+    def run(self, user_input, auto_parallel=True, max_steps=None):
         """Run the agent loop for a single user request.
+
+        max_steps caps the LLM steps for this run (GoalLoop uses it per round);
+        it never exceeds MAX_ITERATIONS.
 
         auto_parallel=False disables the auto-parallel split (used by GoalLoop,
         whose injected goal text must not be split into read-only sub-agents)."""
@@ -7278,7 +7301,10 @@ class Agent:
         _esc_monitor = InputMonitor(on_typeahead=_on_typeahead if _scroll_mode else None)
         _esc_monitor.start()
 
-        for iteration in range(self.MAX_ITERATIONS):
+        _step_limit = self.MAX_ITERATIONS
+        if max_steps:
+            _step_limit = max(1, min(int(max_steps), self.MAX_ITERATIONS))
+        for iteration in range(_step_limit):
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -7384,7 +7410,7 @@ class Agent:
                 self.session._just_compacted = False
 
                 # Handle empty response from local LLM (retry with backoff, max 3)
-                if not text and not tool_calls and iteration < self.MAX_ITERATIONS - 1:
+                if not text and not tool_calls and iteration < _step_limit - 1:
                     _empty_retries += 1
                     if _empty_retries > 3:
                         _p(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
@@ -7727,10 +7753,15 @@ class Agent:
                 self.tracer.emit("error", step=iteration + 1, err=f"{type(e).__name__}: {e}"[:300])
                 break
         else:
-            _end_status = "max_iterations"
-            _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
-            _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
-            _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+            if _step_limit < self.MAX_ITERATIONS:
+                _end_status = "round_step_limit"
+                _p(f"\n{C.YELLOW}◎ Step limit for this round reached ({_step_limit}) — "
+                   f"handing over to verification.{C.RESET}")
+            else:
+                _end_status = "max_iterations"
+                _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
+                _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
+                _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
 
         self.tracer.emit("run_end", status=_end_status, steps=_steps,
                          dur_ms=int((time.time() - _start_time) * 1000))
@@ -8191,7 +8222,7 @@ def main():
         if config.goal:
             try:
                 goal = GoalLoop(config.goal, config.cwd, config.goal_max_rounds,
-                                config.goal_timeout)
+                                config.goal_timeout, config.goal_round_steps)
             except ValueError as e:
                 print(f"{C.RED}--goal: {e}{C.RESET}", file=sys.stderr)
                 sys.exit(2)
@@ -8660,7 +8691,7 @@ def main():
                         print(f"  Goal: {C.DIM}off{C.RESET}")
                     else:
                         agent.goal_loop = GoalLoop(arg, config.cwd, config.goal_max_rounds,
-                                                   config.goal_timeout)
+                                                   config.goal_timeout, config.goal_round_steps)
                         print(f"  Goal set: {C.GREEN}`{arg}`{C.RESET} must exit 0. "
                               f"{C.DIM}Each request now loops until it passes (max "
                               f"{agent.goal_loop.max_rounds} rounds). /goal off to stop.{C.RESET}")

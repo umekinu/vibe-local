@@ -10302,9 +10302,10 @@ class _FakeAgent:
         self._interrupted = threading.Event()
         self._on_run = on_run
 
-    def run(self, prompt, auto_parallel=True):
+    def run(self, prompt, auto_parallel=True, max_steps=None):
         self.prompts.append(prompt)
         self.auto_parallel_flags.append(auto_parallel)
+        self.max_steps_seen = getattr(self, "max_steps_seen", []) + [max_steps]
         if self._on_run:
             self._on_run(self, len(self.prompts))
 
@@ -10706,3 +10707,38 @@ class TestGoalAntiGaming:
         out = vc.WriteTool().execute({"file_path": str(target), "content": "fake history"})
         assert out.startswith("Error:")
         assert target.read_text() == "real history"
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Goal loop: per-round step limit
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGoalRoundSteps:
+
+    def test_default_and_custom_round_steps_passed_to_agent(self, tmp_path):
+        agent = _FakeAgent()
+        vc.GoalLoop("true", str(tmp_path)).run(agent, "t", printer=_quiet)
+        assert agent.max_steps_seen == [vc.GoalLoop.DEFAULT_ROUND_STEPS]
+        agent = _FakeAgent()
+        vc.GoalLoop("true", str(tmp_path), round_steps=4).run(agent, "t", printer=_quiet)
+        assert agent.max_steps_seen == [4]
+
+    def test_invalid_round_steps_fall_back(self, tmp_path):
+        assert vc.GoalLoop("true", str(tmp_path), round_steps="x").round_steps == 12
+        assert vc.GoalLoop("true", str(tmp_path), round_steps=0).round_steps == 1
+
+    def test_step_cut_noted_in_feedback(self, tmp_path):
+        def on_run(agent, n):
+            agent.last_run_status = "round_step_limit" if n == 1 else "done"
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || exit 1', str(tmp_path), round_steps=7)
+        assert gl.run(agent, "t", printer=_quiet)["status"] == "passed"
+        assert "hit its step limit (7)" in agent.prompts[1]
+        assert "echo to think out loud" in agent.prompts[1]
+
+    def test_config_round_steps_flag(self):
+        cfg = vc.Config()
+        assert cfg.goal_round_steps == 12
+        cfg._load_cli_args(["--goal-round-steps", "20"])
+        assert cfg.goal_round_steps == 20
