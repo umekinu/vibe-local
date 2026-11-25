@@ -721,6 +721,10 @@ class Config:
         self.rag_topk = 5
         self.rag_model = "nomic-embed-text"
         self.rag_index = None  # path to index then exit
+        # Goal loop (loop engineering): repeat until verify command exits 0
+        self.goal = None            # verification command
+        self.goal_max_rounds = 5
+        self.goal_timeout = 300     # seconds per verification run
 
         # Paths (primary: vibe-local, with backward compat for old vibe-coder dirs)
         if os.name == "nt":
@@ -865,6 +869,13 @@ class Config:
                             help="Ollama embedding model (default: nomic-embed-text)")
         parser.add_argument("--rag-index", metavar="PATH",
                             help="Index files at PATH for RAG and exit")
+        # Goal loop options
+        parser.add_argument("--goal", metavar="CMD",
+                            help="Repeat the task until CMD exits 0 (e.g. \"pytest -q\"). Use with -p")
+        parser.add_argument("--goal-max-rounds", type=int, default=None,
+                            help="Max agent rounds for --goal (default: 5)")
+        parser.add_argument("--goal-timeout", type=int, default=None,
+                            help="Timeout in seconds for each verify run (default: 300)")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -891,6 +902,12 @@ class Config:
         if args.context_window is not None:
             self.context_window = args.context_window
         # RAG args
+        if args.goal:
+            self.goal = args.goal
+        if args.goal_max_rounds is not None:
+            self.goal_max_rounds = args.goal_max_rounds
+        if args.goal_timeout is not None:
+            self.goal_timeout = args.goal_timeout
         if args.rag:
             self.rag = True
         if args.rag_mode:
@@ -4608,6 +4625,195 @@ class AutoTestRunner:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Goal Loop — repeat agent runs until a verification command passes
+# (trigger → goal → actions → verify → memory)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class GoalLoop:
+    """Runs the agent repeatedly until a user-supplied verification command exits 0.
+
+    - Goal:         `verify_cmd` exits with status 0
+    - Verification: the command is run by the harness (not the model) after every round
+    - Stop rules:   success / max_rounds / same failure N times in a row / user interrupt
+    - Memory:       every round is appended to .vibe/progress.md; recent entries for the
+                    same goal are injected into the first prompt of the next run
+    """
+
+    DEFAULT_MAX_ROUNDS = 5
+    HARD_MAX_ROUNDS = 50
+    NO_PROGRESS_LIMIT = 3      # identical failure signature this many rounds in a row → stop
+    OUTPUT_TAIL = 3000         # chars of verifier output fed back to the model
+    HISTORY_ENTRIES = 5        # past entries injected from progress.md
+    PROGRESS_EXCERPT = 800     # chars of verifier output stored per entry
+
+    def __init__(self, verify_cmd, cwd, max_rounds=None, timeout=300):
+        verify_cmd = (verify_cmd or "").strip()
+        if not verify_cmd:
+            raise ValueError("verify command must not be empty")
+        self.verify_cmd = verify_cmd
+        self.cwd = cwd
+        try:
+            mr = int(max_rounds) if max_rounds is not None else self.DEFAULT_MAX_ROUNDS
+        except (TypeError, ValueError):
+            mr = self.DEFAULT_MAX_ROUNDS
+        self.max_rounds = max(1, min(mr, self.HARD_MAX_ROUNDS))
+        self.timeout = max(1, int(timeout))
+        self.progress_path = os.path.join(cwd, ".vibe", "progress.md")
+
+    # ── Verification ──────────────────────────────────────────────────────────
+    def verify(self):
+        """Run the verification command. Returns (passed, exit_code, output)."""
+        popen_kwargs = dict(shell=True, cwd=self.cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(self.verify_cmd, **popen_kwargs)
+        except OSError as e:
+            return False, -1, f"Could not start verify command: {e}"
+        try:
+            out, _ = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name != "nt":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except Exception:
+                out = b""
+            text = (out or b"").decode("utf-8", errors="replace")
+            return False, -1, text + f"\n[verify command timed out after {self.timeout}s]"
+        text = (out or b"").decode("utf-8", errors="replace")
+        return proc.returncode == 0, proc.returncode, text
+
+    @staticmethod
+    def failure_signature(exit_code, output):
+        """Stable fingerprint of a failure, ignoring timings, addresses and counters."""
+        norm = output or ""
+        norm = re.sub(r"0x[0-9a-fA-F]+", "<hex>", norm)
+        norm = re.sub(r"\d+(?:\.\d+)?", "<n>", norm)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        norm = norm[-2000:]
+        return hashlib.sha1(f"{exit_code}|{norm}".encode("utf-8")).hexdigest()[:12]
+
+    @classmethod
+    def _tail(cls, text, limit):
+        text = text or ""
+        if len(text) <= limit:
+            return text
+        return "...(truncated)\n" + text[-limit:]
+
+    # ── Memory (.vibe/progress.md) ────────────────────────────────────────────
+    def load_history(self):
+        """Return the most recent progress entries recorded for this same goal."""
+        try:
+            if os.path.islink(self.progress_path) or not os.path.isfile(self.progress_path):
+                return []
+            with open(self.progress_path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return []
+        marker = f"- goal: `{self.verify_cmd}`"
+        entries = [e.strip() for e in re.split(r"\n(?=## )", content) if e.startswith("## ")]
+        same = [("## " + e[3:]) for e in entries if marker in e]
+        return same[-self.HISTORY_ENTRIES:]
+
+    def append_progress(self, round_no, passed, exit_code, output, signature, task):
+        """Append one round to .vibe/progress.md (best effort)."""
+        try:
+            d = os.path.dirname(self.progress_path)
+            os.makedirs(d, exist_ok=True)
+            if os.path.islink(self.progress_path):
+                return
+            new_file = not os.path.exists(self.progress_path)
+            task_line = re.sub(r"\s+", " ", task or "").strip()[:200]
+            status = "PASS" if passed else "FAIL"
+            excerpt = self._tail(output, self.PROGRESS_EXCERPT).replace("```", "'''")
+            entry = (
+                f"## {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} round {round_no} {status}\n"
+                f"- goal: `{self.verify_cmd}`\n"
+                f"- task: {task_line}\n"
+                f"- exit: {exit_code}  signature: {signature or '-'}\n"
+            )
+            if not passed:
+                entry += f"\n```\n{excerpt.strip() or '(no output)'}\n```\n"
+            with open(self.progress_path, "a", encoding="utf-8") as f:
+                if new_file:
+                    f.write("# vibe-local goal progress\n\n"
+                            "Auto-generated by --goal / /goal. Each entry is one verification round.\n\n")
+                f.write(entry + "\n")
+        except OSError:
+            pass
+
+    # ── Prompts ───────────────────────────────────────────────────────────────
+    def build_initial_prompt(self, task):
+        parts = [task.rstrip(), "",
+                 f"[GOAL] This task is complete ONLY when `{self.verify_cmd}` exits with status 0.",
+                 "Run that command yourself to check your work before you finish. "
+                 "Do not weaken, skip, or delete the checks to make it pass."]
+        history = self.load_history()
+        if history:
+            parts += ["", "[PREVIOUS ATTEMPTS on this goal, from .vibe/progress.md — "
+                          "do not repeat approaches that already failed]"]
+            parts += history
+        return "\n".join(parts)
+
+    def build_feedback_prompt(self, round_no, exit_code, output, repeated):
+        lines = [
+            f"[GOAL NOT MET — round {round_no}/{self.max_rounds}] "
+            f"`{self.verify_cmd}` exited with status {exit_code}.",
+            "Output (tail):",
+            "```",
+            self._tail(output, self.OUTPUT_TAIL).rstrip() or "(no output)",
+            "```",
+            "Find the root cause and fix it, then run the command again to confirm.",
+        ]
+        if repeated:
+            lines.append("WARNING: this is the SAME failure as the previous round. "
+                         "Your last fix did not change anything — try a different approach.")
+        return "\n".join(lines)
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    def run(self, agent, task, printer=print):
+        """Run the goal loop. Returns dict(status=..., rounds=int).
+        status: 'passed' | 'max_rounds' | 'no_progress' | 'interrupted'"""
+        y, g, r, d, rst = C.YELLOW, C.GREEN, C.RED, C.DIM, C.RESET
+        printer(f"\n{y}◎ Goal:{rst} `{self.verify_cmd}` exits 0  {d}(max {self.max_rounds} rounds){rst}")
+        prompt = self.build_initial_prompt(task)
+        last_sig, same_count = None, 0
+        for round_no in range(1, self.max_rounds + 1):
+            agent.run(prompt, auto_parallel=False)
+            if agent._interrupted.is_set():
+                printer(f"{y}◎ Goal loop stopped by user (round {round_no}).{rst}")
+                return {"status": "interrupted", "rounds": round_no}
+            printer(f"\n{d}◎ Verifying (round {round_no}/{self.max_rounds}): {self.verify_cmd}{rst}")
+            passed, code, output = self.verify()
+            sig = None if passed else self.failure_signature(code, output)
+            self.append_progress(round_no, passed, code, output, sig, task)
+            if passed:
+                printer(f"{g}◎ Goal met in {round_no} round(s).{rst}")
+                return {"status": "passed", "rounds": round_no}
+            if sig == last_sig:
+                same_count += 1
+            else:
+                last_sig, same_count = sig, 1
+            printer(f"{r}◎ Goal not met (exit {code}, signature {sig}).{rst}")
+            if same_count >= self.NO_PROGRESS_LIMIT:
+                printer(f"{y}◎ No progress: same failure {same_count} rounds in a row. Stopping.{rst}")
+                printer(f"{d}  See .vibe/progress.md for the history.{rst}")
+                return {"status": "no_progress", "rounds": round_no}
+            if round_no == self.max_rounds:
+                break
+            prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2)
+        printer(f"{y}◎ Goal not met after {self.max_rounds} rounds. See .vibe/progress.md.{rst}")
+        return {"status": "max_rounds", "rounds": self.max_rounds}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # File Watcher — poll-based file change detection (stdlib only)
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5760,6 +5966,7 @@ class TUI:
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
+                    "/goal",
                 ]
                 def _completer(text, state):
                     if text.startswith("/"):
@@ -6621,6 +6828,8 @@ class TUI:
   {_c198}/checkpoint{C.RESET}        Save git checkpoint
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
+  {_c198}/goal <cmd>{C.RESET}        Loop each request until <cmd> exits 0
+  {_c198}/goal off{C.RESET}          Disable goal loop
   {_c198}/autotest{C.RESET}          Toggle auto lint+test after edits
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
@@ -6711,6 +6920,7 @@ class Agent:
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
+        self.goal_loop = None  # GoalLoop when /goal or --goal is active
 
     @staticmethod
     def _detect_parallel_tasks(user_input):
@@ -6741,14 +6951,17 @@ class Agent:
                 return tasks
         return []
 
-    def run(self, user_input):
-        """Run the agent loop for a single user request."""
+    def run(self, user_input, auto_parallel=True):
+        """Run the agent loop for a single user request.
+
+        auto_parallel=False disables the auto-parallel split (used by GoalLoop,
+        whose injected goal text must not be split into read-only sub-agents)."""
         _p = self.tui._scroll_print  # scroll-region-safe print
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
         # Known limitation: RAG context is not injected when auto-parallel fires, because
         # this branch returns early before the RAG injection block below.
-        if not self._plan_mode:
+        if not self._plan_mode and auto_parallel:
             parallel_tasks = self._detect_parallel_tasks(user_input)
             if len(parallel_tasks) >= 2:
                 pa_tool = self.registry.get("ParallelAgents")
@@ -7572,6 +7785,18 @@ def main():
 
     # One-shot mode
     if config.prompt:
+        if config.goal:
+            try:
+                goal = GoalLoop(config.goal, config.cwd, config.goal_max_rounds,
+                                config.goal_timeout)
+            except ValueError as e:
+                print(f"{C.RED}--goal: {e}{C.RESET}", file=sys.stderr)
+                sys.exit(2)
+            result = goal.run(agent, config.prompt, printer=tui._scroll_print)
+            session.save()
+            if result["status"] != "passed":
+                sys.exit(1)
+            return
         agent.run(config.prompt)
         session.save()
         return
@@ -8017,6 +8242,29 @@ def main():
                         print(f"{C.YELLOW}{msg}{C.RESET}")
                     continue
 
+                # ── Goal loop ────────────────────────────────────────
+                elif cmd == "/goal":
+                    arg = user_input.strip()[len("/goal"):].strip()
+                    if not arg:
+                        if agent.goal_loop is None:
+                            print(f"  Goal: {C.DIM}off{C.RESET}  (set with /goal <verify command>)")
+                        else:
+                            gl = agent.goal_loop
+                            print(f"  Goal: {C.GREEN}`{gl.verify_cmd}`{C.RESET} exits 0 "
+                                  f"{C.DIM}(max {gl.max_rounds} rounds, history: .vibe/progress.md){C.RESET}")
+                    elif arg.lower() in ("off", "clear", "none"):
+                        agent.goal_loop = None
+                        print(f"  Goal: {C.DIM}off{C.RESET}")
+                    else:
+                        agent.goal_loop = GoalLoop(arg, config.cwd, config.goal_max_rounds,
+                                                   config.goal_timeout)
+                        print(f"  Goal set: {C.GREEN}`{arg}`{C.RESET} must exit 0. "
+                              f"{C.DIM}Each request now loops until it passes (max "
+                              f"{agent.goal_loop.max_rounds} rounds). /goal off to stop.{C.RESET}")
+                        if not config.yes_mode:
+                            print(f"  {C.DIM}Note: the verify command runs without a permission prompt.{C.RESET}")
+                    continue
+
                 # ── Auto test toggle ─────────────────────────────────
                 elif cmd == "/autotest":
                     agent.auto_test.enabled = not agent.auto_test.enabled
@@ -8139,7 +8387,7 @@ def main():
                                  "/tokens", "/commit", "/diff", "/git", "/plan",
                                  "/approve", "/act", "/execute", "/undo", "/init",
                                  "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                 "/rollback", "/autotest", "/skills"]
+                                 "/rollback", "/autotest", "/skills", "/goal"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
@@ -8149,8 +8397,11 @@ def main():
                         print(f"{C.YELLOW}Unknown command. Type /help for available commands.{C.RESET}")
                     continue
 
-            # Run agent
-            agent.run(user_input)
+            # Run agent (wrapped in the goal loop when /goal is active)
+            if agent.goal_loop is not None and not agent._plan_mode:
+                agent.goal_loop.run(agent, user_input, printer=tui._scroll_print)
+            else:
+                agent.run(user_input)
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:
