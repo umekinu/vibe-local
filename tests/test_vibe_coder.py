@@ -10287,3 +10287,146 @@ class TestPermissionInputHandling:
                 with mock.patch.object(vc.TUI, "_read_permission_input", return_value=inp):
                     result = tui.ask_permission("Bash", {"command": "ls"})
                     assert result == "allow_all", f"Input '{inp}' should return 'allow_all'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Goal loop (loop engineering: goal → verify → memory)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _FakeAgent:
+    """Minimal stand-in for Agent: records prompts, optionally mutates state."""
+
+    def __init__(self, on_run=None):
+        self.prompts = []
+        self.auto_parallel_flags = []
+        self._interrupted = threading.Event()
+        self._on_run = on_run
+
+    def run(self, prompt, auto_parallel=True):
+        self.prompts.append(prompt)
+        self.auto_parallel_flags.append(auto_parallel)
+        if self._on_run:
+            self._on_run(self, len(self.prompts))
+
+
+def _quiet(*a, **k):
+    pass
+
+
+class TestGoalLoop:
+
+    def test_rejects_empty_command(self, tmp_path):
+        with pytest.raises(ValueError):
+            vc.GoalLoop("   ", str(tmp_path))
+
+    def test_max_rounds_clamped(self, tmp_path):
+        assert vc.GoalLoop("true", str(tmp_path), max_rounds=0).max_rounds == 1
+        assert vc.GoalLoop("true", str(tmp_path), max_rounds=10**6).max_rounds == vc.GoalLoop.HARD_MAX_ROUNDS
+        assert vc.GoalLoop("true", str(tmp_path), max_rounds="x").max_rounds == vc.GoalLoop.DEFAULT_MAX_ROUNDS
+
+    def test_verify_pass_and_fail(self, tmp_path):
+        ok, code, out = vc.GoalLoop("echo hi", str(tmp_path)).verify()
+        assert ok and code == 0 and "hi" in out
+        ok, code, out = vc.GoalLoop("echo boom; exit 3", str(tmp_path)).verify()
+        assert not ok and code == 3 and "boom" in out
+
+    def test_verify_timeout(self, tmp_path):
+        ok, code, out = vc.GoalLoop("sleep 5", str(tmp_path), timeout=1).verify()
+        assert not ok and "timed out" in out
+
+    def test_signature_ignores_numbers(self):
+        a = vc.GoalLoop.failure_signature(1, "FAILED test_x in 0.12s at 0xdeadbeef")
+        b = vc.GoalLoop.failure_signature(1, "FAILED test_x in 3.45s at 0x00c0ffee")
+        c = vc.GoalLoop.failure_signature(1, "FAILED test_y in 0.12s")
+        assert a == b and a != c
+
+    def test_passes_on_second_round_and_records_progress(self, tmp_path):
+        flag = tmp_path / "done"
+
+        def on_run(agent, n):
+            if n == 2:
+                flag.write_text("ok")
+
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop(f"test -f {flag}", str(tmp_path), max_rounds=5)
+        res = gl.run(agent, "make it pass", printer=_quiet)
+        assert res == {"status": "passed", "rounds": 2}
+        assert "[GOAL]" in agent.prompts[0]
+        assert "GOAL NOT MET" in agent.prompts[1]
+        assert agent.auto_parallel_flags == [False, False]  # goal text must not be split
+        progress = (tmp_path / ".vibe" / "progress.md").read_text()
+        assert "round 1 FAIL" in progress and "round 2 PASS" in progress
+
+    def test_no_progress_stops_early(self, tmp_path):
+        agent = _FakeAgent()
+        gl = vc.GoalLoop("echo same error; exit 1", str(tmp_path), max_rounds=10)
+        res = gl.run(agent, "task", printer=_quiet)
+        assert res["status"] == "no_progress"
+        assert res["rounds"] == vc.GoalLoop.NO_PROGRESS_LIMIT
+        assert "SAME failure" in agent.prompts[-1]
+
+    def test_max_rounds_when_failure_changes(self, tmp_path):
+        counter = tmp_path / "n"
+        counter.write_text("0")
+
+        def on_run(agent, n):
+            counter.write_text("x" * n)  # different output each round
+
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop(f"cat {counter}; exit 1", str(tmp_path), max_rounds=3)
+        res = gl.run(agent, "task", printer=_quiet)
+        assert res == {"status": "max_rounds", "rounds": 3}
+        assert len(agent.prompts) == 3
+
+    def test_interrupt_stops_without_verifying(self, tmp_path):
+        def on_run(agent, n):
+            agent._interrupted.set()
+
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop("exit 1", str(tmp_path))
+        res = gl.run(agent, "task", printer=_quiet)
+        assert res == {"status": "interrupted", "rounds": 1}
+        assert not (tmp_path / ".vibe" / "progress.md").exists()
+
+    def test_history_injected_only_for_same_goal(self, tmp_path):
+        vc.GoalLoop("exit 1", str(tmp_path), max_rounds=1).run(_FakeAgent(), "first", printer=_quiet)
+        vc.GoalLoop("exit 2", str(tmp_path), max_rounds=1).run(_FakeAgent(), "other", printer=_quiet)
+        gl = vc.GoalLoop("exit 1", str(tmp_path))
+        hist = gl.load_history()
+        assert len(hist) == 1 and "task: first" in hist[0]
+        prompt = gl.build_initial_prompt("again")
+        assert "PREVIOUS ATTEMPTS" in prompt and "task: first" in prompt
+        assert "task: other" not in prompt
+
+    def test_history_capped(self, tmp_path):
+        gl = vc.GoalLoop("exit 1", str(tmp_path))
+        for i in range(vc.GoalLoop.HISTORY_ENTRIES + 3):
+            gl.append_progress(i + 1, False, 1, "err", "sig", f"t{i}")
+        assert len(gl.load_history()) == vc.GoalLoop.HISTORY_ENTRIES
+
+    def test_goal_prompt_would_trigger_auto_parallel(self, tmp_path):
+        # Regression guard: the injected goal text is parallel-detectable, which is
+        # why GoalLoop must call Agent.run(..., auto_parallel=False).
+        prompt = vc.GoalLoop("test -f x", str(tmp_path)).build_initial_prompt("create x")
+        assert vc.Agent._detect_parallel_tasks(prompt)
+
+    def test_verify_gets_round_env(self, tmp_path):
+        ok, _, out = vc.GoalLoop('echo "r=$VIBE_GOAL_ROUND"', str(tmp_path)).verify(3)
+        assert ok and "r=3" in out
+
+    def test_round_env_makes_retry_deterministic(self, tmp_path):
+        # Even if the model runs the verify command itself, it fails until round 2.
+        agent = _FakeAgent()
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || { echo "fail until round 2"; exit 1; }',
+                         str(tmp_path))
+        res = gl.run(agent, "task", printer=_quiet)
+        assert res == {"status": "passed", "rounds": 2}
+        assert "fail until round 2" in agent.prompts[1]
+
+    def test_config_goal_args(self):
+        cfg = vc.Config()
+        cfg._load_cli_args(["-p", "x", "--goal", "pytest -q", "--goal-max-rounds", "7",
+                            "--goal-timeout", "60"])
+        assert cfg.goal == "pytest -q"
+        assert cfg.goal_max_rounds == 7
+        assert cfg.goal_timeout == 60

@@ -34,3 +34,5 @@ node_modules/
 
 # vibe-local RAG index (local, user-specific — not for version control)
 .vibe/rag/
+# vibe-local goal loop history (may contain verify output — keep local)
+.vibe/progress.md

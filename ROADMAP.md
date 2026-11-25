@@ -41,8 +41,9 @@ NEW: vibe-local.sh → vibe-coder.py (OSS) → Ollama direct
 | 3 | Context compaction | DONE |
 | 4 | Permission system (safe/ask/network tiers) | DONE |
 | 4 | -y flag (auto-approve) | DONE |
-| 5 | Subagent/Task tools | TODO |
-| 5 | Plan mode | TODO |
+| 5 | Subagent/Task tools | DONE |
+| 5 | Plan mode | DONE |
+| 6 | Goal loop (`--goal CMD` / `/goal CMD`: verify → feedback → retry, no-progress stop, `.vibe/progress.md` memory) | DONE |
 
 ### Launcher Updates
 - vibe-local.sh: Updated to use vibe-coder.py directly (no proxy)
