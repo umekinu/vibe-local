@@ -725,6 +725,9 @@ class Config:
         self.goal = None            # verification command
         self.goal_max_rounds = 5
         self.goal_timeout = 300     # seconds per verification run
+        # Trace log (.vibe/trace.jsonl) — metadata only; disable with --no-trace / VIBE_TRACE=0
+        self.trace_summary = None   # --trace-summary N: print last N runs and exit
+        self.trace = os.environ.get("VIBE_TRACE", "1").strip().lower() not in ("0", "false", "off", "no")
 
         # Paths (primary: vibe-local, with backward compat for old vibe-coder dirs)
         if os.name == "nt":
@@ -876,8 +879,16 @@ class Config:
                             help="Max agent rounds for --goal (default: 5)")
         parser.add_argument("--goal-timeout", type=int, default=None,
                             help="Timeout in seconds for each verify run (default: 300)")
+        parser.add_argument("--no-trace", action="store_true",
+                            help="Do not write .vibe/trace.jsonl")
+        parser.add_argument("--trace-summary", type=int, nargs="?", const=1, default=None, metavar="N",
+                            help="Print a summary of the last N runs from .vibe/trace.jsonl and exit")
         args = parser.parse_args(argv)
 
+        if args.no_trace:
+            self.trace = False
+        if args.trace_summary is not None:
+            self.trace_summary = max(1, min(args.trace_summary, 50))
         if args.prompt:
             self.prompt = args.prompt
         if args.model:
@@ -4625,6 +4636,170 @@ class AutoTestRunner:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Tracer — structured run log (.vibe/trace.jsonl) for observability
+# ════════════════════════════════════════════════════════════════════════════════
+
+class Tracer:
+    """Append-only JSONL trace of agent runs: LLM calls, tool calls, goal rounds.
+
+    Records metadata only (tool name, short argument summary, durations, token
+    counts, status) — never file contents or full tool output. Best effort:
+    any I/O error silently disables nothing and never breaks the agent.
+    """
+
+    MAX_BYTES = 5 * 1024 * 1024   # rotate to trace.jsonl.1 beyond this
+    ARG_MAX = 120                 # chars of argument summary kept per tool call
+    ARG_KEYS = ("file_path", "notebook_path", "path", "command", "pattern",
+                "url", "query", "prompt")
+
+    def __init__(self, cwd, enabled=True, session=None):
+        self.enabled = enabled
+        self.path = os.path.join(cwd, ".vibe", "trace.jsonl")
+        self._session = session
+        self._lock = threading.Lock()
+        self.run_id = None
+        self.group = None   # goal-loop id while a goal loop is active
+
+    def new_run(self):
+        self.run_id = uuid.uuid4().hex[:8]
+        return self.run_id
+
+    @classmethod
+    def summarize_args(cls, params):
+        if not isinstance(params, dict):
+            return ""
+        for k in cls.ARG_KEYS:
+            v = params.get(k)
+            if isinstance(v, str) and v:
+                v = re.sub(r"\s+", " ", v).strip()
+                return v if len(v) <= cls.ARG_MAX else v[:cls.ARG_MAX] + "…"
+        return ""
+
+    def emit(self, event, **fields):
+        if not self.enabled:
+            return
+        rec = {"ts": datetime.now().isoformat(timespec="milliseconds"), "ev": event}
+        sid = getattr(self._session, "session_id", None)
+        if sid:
+            rec["sid"] = sid
+        if self.run_id:
+            rec["run"] = self.run_id
+        if self.group:
+            rec["group"] = self.group
+        rec.update(fields)
+        try:
+            line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+            with self._lock:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                if os.path.islink(self.path):
+                    return
+                try:
+                    if os.path.getsize(self.path) > self.MAX_BYTES:
+                        os.replace(self.path, self.path + ".1")
+                except OSError:
+                    pass
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    # ── Reading / summarizing ─────────────────────────────────────────────────
+    @staticmethod
+    def load(path):
+        events = []
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                return events
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ev, dict):
+                        events.append(ev)
+        except OSError:
+            pass
+        return events
+
+    @staticmethod
+    def last_units(events, n=1):
+        """Split events into units (a goal loop group, or a standalone run) and
+        return the events of the last n units, oldest first."""
+        units, index = [], {}
+        for ev in events:
+            key = ("g", ev["group"]) if ev.get("group") else ("r", ev.get("run"))
+            if key[1] is None:
+                continue
+            if key not in index:
+                index[key] = len(units)
+                units.append([])
+            units[index[key]].append(ev)
+        return units[-max(1, n):]
+
+    @staticmethod
+    def summarize(unit_events):
+        """Human-readable summary of one unit (list of events)."""
+        if not unit_events:
+            return "No trace events."
+        lines = []
+        first, last = unit_events[0], unit_events[-1]
+        runs = [e for e in unit_events if e.get("ev") == "run_end"]
+        llm = [e for e in unit_events if e.get("ev") == "llm"]
+        tools = [e for e in unit_events if e.get("ev") == "tool"]
+        rounds = [e for e in unit_events if e.get("ev") == "goal_round"]
+        goal_start = next((e for e in unit_events if e.get("ev") == "goal_start"), None)
+        goal_end = next((e for e in unit_events if e.get("ev") == "goal_end"), None)
+
+        head = f"{first.get('ts', '?')[:19]}"
+        if goal_start:
+            head += f"  goal `{goal_start.get('cmd', '')}`"
+            if goal_end:
+                head += f" → {goal_end.get('status')} in {goal_end.get('rounds')} round(s)"
+        elif runs:
+            head += f"  run → {runs[-1].get('status')}"
+        lines.append(head)
+
+        p_tok = sum(int(e.get("prompt_tokens") or 0) for e in llm)
+        c_tok = sum(int(e.get("completion_tokens") or 0) for e in llm)
+        llm_ms = sum(int(e.get("dur_ms") or 0) for e in llm)
+        tool_ms = sum(int(e.get("dur_ms") or 0) for e in tools)
+        lines.append(f"  LLM calls: {len(llm)}  ({llm_ms / 1000:.1f}s, tokens {p_tok}→{c_tok})")
+        errs = [t for t in tools if not t.get("ok", True)]
+        lines.append(f"  Tool calls: {len(tools)}  ({tool_ms / 1000:.1f}s, errors {len(errs)})")
+
+        by_name = collections.Counter(t.get("name", "?") for t in tools)
+        if by_name:
+            lines.append("    " + "  ".join(f"{k}×{v}" for k, v in by_name.most_common()))
+        slow = sorted(tools, key=lambda t: -int(t.get("dur_ms") or 0))[:3]
+        slow = [t for t in slow if int(t.get("dur_ms") or 0) >= 1000]
+        if slow:
+            lines.append("  Slowest:")
+            for t in slow:
+                lines.append(f"    {int(t['dur_ms']) / 1000:.1f}s  {t.get('name')}  {t.get('arg', '')}")
+        if errs:
+            lines.append("  Errors:")
+            for t in errs[-5:]:
+                lines.append(f"    {t.get('name')}  {t.get('arg', '')}  {t.get('err', '')}")
+        for rd in rounds:
+            mark = "PASS" if rd.get("passed") else f"FAIL exit {rd.get('exit')} sig {rd.get('sig')}"
+            lines.append(f"  round {rd.get('round')}: {mark}  (verify {int(rd.get('verify_ms') or 0) / 1000:.1f}s)")
+        for r in runs:
+            if r.get("status") not in ("done",):
+                lines.append(f"  run {r.get('run')}: {r.get('status')} after {r.get('steps')} step(s)")
+        try:
+            t0 = datetime.fromisoformat(first["ts"])
+            t1 = datetime.fromisoformat(last["ts"])
+            lines.append(f"  Wall time: {(t1 - t0).total_seconds():.1f}s")
+        except (KeyError, ValueError, TypeError):
+            pass
+        return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Goal Loop — repeat agent runs until a verification command passes
 # (trigger → goal → actions → verify → memory)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -4790,19 +4965,41 @@ class GoalLoop:
         y, g, r, d, rst = C.YELLOW, C.GREEN, C.RED, C.DIM, C.RESET
         printer(f"\n{y}◎ Goal:{rst} `{self.verify_cmd}` exits 0  {d}(max {self.max_rounds} rounds){rst}")
         prompt = self.build_initial_prompt(task)
+        tracer = getattr(agent, "tracer", None)
+        if tracer is not None:
+            tracer.group = "g" + uuid.uuid4().hex[:7]
+            tracer.emit("goal_start", cmd=self.verify_cmd, max_rounds=self.max_rounds)
+        try:
+            return self._run_rounds(agent, task, prompt, printer, tracer)
+        finally:
+            if tracer is not None:
+                tracer.group = None
+
+    def _run_rounds(self, agent, task, prompt, printer, tracer):
+        y, g, r, d, rst = C.YELLOW, C.GREEN, C.RED, C.DIM, C.RESET
         last_sig, same_count = None, 0
+
+        def _end(status, rounds):
+            if tracer is not None:
+                tracer.emit("goal_end", status=status, rounds=rounds)
+            return {"status": status, "rounds": rounds}
+
         for round_no in range(1, self.max_rounds + 1):
             agent.run(prompt, auto_parallel=False)
             if agent._interrupted.is_set():
                 printer(f"{y}◎ Goal loop stopped by user (round {round_no}).{rst}")
-                return {"status": "interrupted", "rounds": round_no}
+                return _end("interrupted", round_no)
             printer(f"\n{d}◎ Verifying (round {round_no}/{self.max_rounds}): {self.verify_cmd}{rst}")
+            _v0 = time.time()
             passed, code, output = self.verify(round_no)
             sig = None if passed else self.failure_signature(code, output)
+            if tracer is not None:
+                tracer.emit("goal_round", round=round_no, passed=passed, exit=code, sig=sig,
+                            verify_ms=int((time.time() - _v0) * 1000))
             self.append_progress(round_no, passed, code, output, sig, task)
             if passed:
                 printer(f"{g}◎ Goal met in {round_no} round(s).{rst}")
-                return {"status": "passed", "rounds": round_no}
+                return _end("passed", round_no)
             if sig == last_sig:
                 same_count += 1
             else:
@@ -4811,12 +5008,12 @@ class GoalLoop:
             if same_count >= self.NO_PROGRESS_LIMIT:
                 printer(f"{y}◎ No progress: same failure {same_count} rounds in a row. Stopping.{rst}")
                 printer(f"{d}  See .vibe/progress.md for the history.{rst}")
-                return {"status": "no_progress", "rounds": round_no}
+                return _end("no_progress", round_no)
             if round_no == self.max_rounds:
                 break
             prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2)
         printer(f"{y}◎ Goal not met after {self.max_rounds} rounds. See .vibe/progress.md.{rst}")
-        return {"status": "max_rounds", "rounds": self.max_rounds}
+        return _end("max_rounds", self.max_rounds)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5972,7 +6169,7 @@ class TUI:
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
-                    "/goal",
+                    "/goal", "/trace",
                 ]
                 def _completer(text, state):
                     if text.startswith("/"):
@@ -6240,6 +6437,7 @@ class TUI:
         (Qwen models sometimes emit tool calls as XML in the response text).
         """
         raw_parts = []
+        self.last_stream_usage = None  # filled from the final chunk (for tracing)
         in_think = False
         think_buf = ""    # buffer to detect <think> / </think> split across chunks
         header_printed = False
@@ -6279,6 +6477,8 @@ class TUI:
                 _status_line_shown = False
 
         for chunk in response_iter:
+            if chunk.get("usage"):
+                self.last_stream_usage = chunk["usage"]
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
 
@@ -6836,6 +7036,7 @@ class TUI:
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
   {_c198}/goal <cmd>{C.RESET}        Loop each request until <cmd> exits 0
   {_c198}/goal off{C.RESET}          Disable goal loop
+  {_c198}/trace [N]{C.RESET}         Summarize last N runs (.vibe/trace.jsonl)
   {_c198}/autotest{C.RESET}          Toggle auto lint+test after edits
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
@@ -6927,6 +7128,7 @@ class Agent:
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
         self.goal_loop = None  # GoalLoop when /goal or --goal is active
+        self.tracer = Tracer(config.cwd, enabled=getattr(config, "trace", True), session=session)
 
     @staticmethod
     def _detect_parallel_tasks(user_input):
@@ -6997,6 +7199,11 @@ class Agent:
                     print(f"{C.DIM}[debug] RAG query failed: {e}{C.RESET}", file=sys.stderr)
         self.session.add_user_message(user_input)
         self._interrupted.clear()
+        self.tracer.new_run()
+        self.tracer.emit("run_start", model=self.config.model, input_chars=len(user_input),
+                         plan_mode=self._plan_mode)
+        _end_status = "unknown"
+        _steps = 0
         _recent_tool_calls = []  # track recent calls for loop detection
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
@@ -7016,6 +7223,7 @@ class Agent:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
                     self._interrupted.set()
+                _end_status = "interrupted"
                 break
 
             text = ""
@@ -7045,6 +7253,8 @@ class Agent:
 
                 response = None
                 last_error = None
+                _steps = iteration + 1
+                _llm_t0 = time.time()
                 for retry in range(self.MAX_RETRIES + 1):
                     try:
                         response = self.client.chat(
@@ -7068,6 +7278,7 @@ class Agent:
                 if response is None:
                     _p(f"\n{C.RED}The AI didn't respond. It may still be loading or ran out of memory.{C.RESET}")
                     _p(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
+                    _end_status = "no_response"
                     break
 
                 # 2. Parse response
@@ -7085,6 +7296,15 @@ class Agent:
                     finally:
                         if hasattr(response, 'close'):
                             response.close()
+
+                # Trace this LLM call (usage from sync response or final stream chunk)
+                _usage = (response.get("usage", {}) if isinstance(response, dict)
+                          else (getattr(self.tui, "last_stream_usage", None) or {}))
+                self.tracer.emit("llm", step=iteration + 1,
+                                 dur_ms=int((time.time() - _llm_t0) * 1000),
+                                 prompt_tokens=_usage.get("prompt_tokens", 0),
+                                 completion_tokens=_usage.get("completion_tokens", 0),
+                                 tool_calls=len(tool_calls or []), text_chars=len(text or ""))
 
                 # Reconcile token estimate with actual usage from API
                 # Skip reconciliation right after compaction to avoid drift
@@ -7109,6 +7329,7 @@ class Agent:
                     if _empty_retries > 3:
                         _p(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
                         _p(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
+                        _end_status = "empty_response"
                         break
                     if self.config.debug:
                         print(f"{C.DIM}[debug] Empty response (retry {_empty_retries}/3), backing off...{C.RESET}", file=sys.stderr)
@@ -7120,6 +7341,7 @@ class Agent:
 
                 # 4. If no tool calls, we're done
                 if not tool_calls:
+                    _end_status = "done"
                     break
 
                 # 5. Detect infinite tool call loops
@@ -7138,6 +7360,7 @@ class Agent:
                     if all(r == recent[0] for r in recent):
                         _p(f"\n{C.YELLOW}The AI got stuck repeating the same action. Stopped.{C.RESET}")
                         _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
+                        _end_status = "stuck"
                         break
                 if len(_recent_tool_calls) > 10:
                     _recent_tool_calls = _recent_tool_calls[-10:]
@@ -7257,6 +7480,7 @@ class Agent:
                         except (concurrent.futures.CancelledError, Exception) as e:
                             result = ToolResult(tc_id, f"Tool error: {e}", True)
                         _pdur = _parallel_durations.get(tc_id)
+                        self._trace_tool(tool_name, tool_params, _pdur, result.is_error, result.output)
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
@@ -7281,6 +7505,7 @@ class Agent:
                             _is_err = isinstance(output, str) and (
                                 output.startswith("Error:") or output.startswith("Error -")
                             )
+                            self._trace_tool(tool_name, tool_params, _tool_dur, _is_err, output)
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
@@ -7318,6 +7543,7 @@ class Agent:
                             self.tui.stop_spinner()
                             _tool_dur = time.time() - _tool_t0
                             results.append(ToolResult(tc_id, "Interrupted by user", True))
+                            self._trace_tool(tool_name, tool_params, _tool_dur, True, "Interrupted")
                             self.tui.show_tool_result(tool_name, "Interrupted", True, duration=_tool_dur, params=tool_params)
                             self._interrupted.set()
                             break
@@ -7325,6 +7551,7 @@ class Agent:
                             self.tui.stop_spinner()
                             _tool_dur = time.time() - _tool_t0
                             error_msg = f"Tool error: {e}"
+                            self._trace_tool(tool_name, tool_params, _tool_dur, True, error_msg)
                             self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, error_msg, True))
 
@@ -7341,6 +7568,7 @@ class Agent:
 
                 # Skip compaction if interrupted — just save partial results and break
                 if self._interrupted.is_set():
+                    _end_status = "interrupted"
                     break
 
                 # 7. Context compaction check
@@ -7361,6 +7589,7 @@ class Agent:
                     self.session.add_assistant_message(text)
                 _p(f"\n{C.YELLOW}Interrupted.{C.RESET}")
                 self._interrupted.set()
+                _end_status = "interrupted"
                 break
             except urllib.error.HTTPError as e:
                 self.tui.stop_spinner()
@@ -7384,6 +7613,7 @@ class Agent:
                     _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
                 elif e.code == 400:
                     _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
+                _end_status = f"http_{e.code}"
                 break
             except urllib.error.URLError as e:
                 self.tui.stop_spinner()
@@ -7394,6 +7624,7 @@ class Agent:
                 _p(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
                 _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
                 _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
+                _end_status = "connection_error"
                 break
             except Exception as e:
                 self.tui.stop_spinner()
@@ -7407,15 +7638,31 @@ class Agent:
                     traceback.print_exc()
                 else:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
+                _end_status = "error"
+                self.tracer.emit("error", step=iteration + 1, err=f"{type(e).__name__}: {e}"[:300])
                 break
         else:
+            _end_status = "max_iterations"
             _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
             _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
 
+        self.tracer.emit("run_end", status=_end_status, steps=_steps,
+                         dur_ms=int((time.time() - _start_time) * 1000))
+        self.last_run_status = _end_status
+
         # Stop ESC monitor (scroll region stays active — managed by main loop)
         self._last_typeahead = _esc_monitor.get_typeahead()
         _esc_monitor.stop()
+
+    def _trace_tool(self, name, params, dur, is_err, output):
+        """Record one tool call (metadata only) in the trace log."""
+        fields = {"name": name, "arg": Tracer.summarize_args(params),
+                  "dur_ms": int((dur or 0) * 1000), "ok": not is_err,
+                  "out_chars": len(output) if isinstance(output, str) else 0}
+        if is_err and isinstance(output, str):
+            fields["err"] = re.sub(r"\s+", " ", output)[:160]
+        self.tracer.emit("tool", **fields)
 
     def get_typeahead(self):
         """Return and clear any type-ahead text captured during last run()."""
@@ -7553,6 +7800,18 @@ def main():
         print("─" * 60)
         for s in sessions:
             print(f"{s['id']:<20} {s['modified']:<18} {s['messages']:<10} {s['size']:<10}")
+        return
+
+    # Handle --trace-summary (print and exit; no Ollama needed)
+    if config.trace_summary:
+        path = Tracer(config.cwd).path
+        units = Tracer.last_units(Tracer.load(path), config.trace_summary)
+        if not units:
+            print(f"No trace found: {path}")
+            return
+        for u in units:
+            print(Tracer.summarize(u))
+            print()
         return
 
     # Handle --rag-index (index files and exit)
@@ -8271,6 +8530,27 @@ def main():
                             print(f"  {C.DIM}Note: the verify command runs without a permission prompt.{C.RESET}")
                     continue
 
+                # ── Trace summary ────────────────────────────────────
+                elif cmd == "/trace":
+                    arg = user_input.strip()[len("/trace"):].strip()
+                    tr = agent.tracer
+                    if arg.lower() in ("off", "on"):
+                        tr.enabled = arg.lower() == "on"
+                        print(f"  Trace: {'ON' if tr.enabled else 'OFF'}  {C.DIM}({tr.path}){C.RESET}")
+                        continue
+                    try:
+                        n = max(1, min(int(arg), 20)) if arg else 1
+                    except ValueError:
+                        print(f"{C.YELLOW}Usage: /trace [N] | /trace on | /trace off{C.RESET}")
+                        continue
+                    units = Tracer.last_units(Tracer.load(tr.path), n)
+                    if not units:
+                        state = "" if tr.enabled else " (tracing is OFF)"
+                        print(f"  {C.DIM}No trace yet{state}: {tr.path}{C.RESET}")
+                    for u in units:
+                        print(Tracer.summarize(u))
+                    continue
+
                 # ── Auto test toggle ─────────────────────────────────
                 elif cmd == "/autotest":
                     agent.auto_test.enabled = not agent.auto_test.enabled
@@ -8393,7 +8673,7 @@ def main():
                                  "/tokens", "/commit", "/diff", "/git", "/plan",
                                  "/approve", "/act", "/execute", "/undo", "/init",
                                  "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                 "/rollback", "/autotest", "/skills", "/goal"]
+                                 "/rollback", "/autotest", "/skills", "/goal", "/trace"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []

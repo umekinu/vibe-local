@@ -36,3 +36,5 @@ node_modules/
 .vibe/rag/
 # vibe-local goal loop history (may contain verify output — keep local)
 .vibe/progress.md
+.vibe/trace.jsonl
+.vibe/trace.jsonl.1

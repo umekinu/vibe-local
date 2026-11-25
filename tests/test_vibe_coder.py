@@ -10430,3 +10430,110 @@ class TestGoalLoop:
         assert cfg.goal == "pytest -q"
         assert cfg.goal_max_rounds == 7
         assert cfg.goal_timeout == 60
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tracer (.vibe/trace.jsonl)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTracer:
+
+    def test_emit_writes_jsonl_with_ids(self, tmp_path):
+        sess = mock.Mock(session_id="s1")
+        tr = vc.Tracer(str(tmp_path), session=sess)
+        tr.new_run()
+        tr.emit("tool", name="Read", ok=True)
+        ev = vc.Tracer.load(tr.path)
+        assert len(ev) == 1
+        assert ev[0]["ev"] == "tool" and ev[0]["sid"] == "s1" and ev[0]["run"] == tr.run_id
+
+    def test_disabled_writes_nothing(self, tmp_path):
+        tr = vc.Tracer(str(tmp_path), enabled=False)
+        tr.emit("x")
+        assert not os.path.exists(tr.path)
+
+    def test_summarize_args_truncates_and_picks_key(self):
+        assert vc.Tracer.summarize_args({"file_path": "/a/b.py", "content": "SECRET"}) == "/a/b.py"
+        long = vc.Tracer.summarize_args({"command": "x" * 500})
+        assert len(long) == vc.Tracer.ARG_MAX + 1 and long.endswith("…")
+        assert vc.Tracer.summarize_args({"content": "only content"}) == ""
+
+    def test_rotation(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vc.Tracer, "MAX_BYTES", 200)
+        tr = vc.Tracer(str(tmp_path))
+        for i in range(20):
+            tr.emit("e", i=i)
+        assert os.path.exists(tr.path + ".1")
+        assert os.path.getsize(tr.path) < 400
+
+    def test_symlink_not_followed(self, tmp_path):
+        target = tmp_path / "elsewhere.txt"
+        target.write_text("")
+        (tmp_path / ".vibe").mkdir()
+        os.symlink(target, tmp_path / ".vibe" / "trace.jsonl")
+        vc.Tracer(str(tmp_path)).emit("e")
+        assert target.read_text() == ""
+
+    def test_load_skips_garbage(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.write_text('{"ev":"a","run":"r"}\nnot json\n[1,2]\n\n{"ev":"b","run":"r"}\n')
+        assert [e["ev"] for e in vc.Tracer.load(str(p))] == ["a", "b"]
+
+    def test_last_units_groups_goal_runs(self):
+        ev = [
+            {"ev": "run_start", "run": "r1"},
+            {"ev": "run_end", "run": "r1", "status": "done"},
+            {"ev": "goal_start", "group": "g1"},
+            {"ev": "run_start", "run": "r2", "group": "g1"},
+            {"ev": "run_start", "run": "r3", "group": "g1"},
+            {"ev": "goal_end", "group": "g1", "status": "passed", "rounds": 2},
+        ]
+        units = vc.Tracer.last_units(ev, 1)
+        assert len(units) == 1 and len(units[0]) == 4
+        assert len(vc.Tracer.last_units(ev, 5)) == 2
+
+    def test_summarize_reports_tokens_tools_errors_rounds(self):
+        ev = [
+            {"ts": "2026-11-25T10:00:00.000", "ev": "goal_start", "group": "g", "cmd": "pytest -q"},
+            {"ts": "2026-11-25T10:00:01.000", "ev": "llm", "group": "g", "dur_ms": 1500,
+             "prompt_tokens": 100, "completion_tokens": 20},
+            {"ts": "2026-11-25T10:00:02.000", "ev": "tool", "group": "g", "name": "Bash",
+             "arg": "pytest", "dur_ms": 2500, "ok": False, "err": "Error: boom"},
+            {"ts": "2026-11-25T10:00:03.000", "ev": "goal_round", "group": "g", "round": 1,
+             "passed": False, "exit": 1, "sig": "abc", "verify_ms": 300},
+            {"ts": "2026-11-25T10:00:05.000", "ev": "goal_end", "group": "g", "status": "no_progress", "rounds": 1},
+        ]
+        out = vc.Tracer.summarize(ev)
+        assert "goal `pytest -q` → no_progress" in out
+        assert "tokens 100→20" in out
+        assert "Bash×1" in out and "errors 1" in out and "Error: boom" in out
+        assert "round 1: FAIL exit 1 sig abc" in out
+        assert "Wall time: 5.0s" in out
+
+    def test_goal_loop_emits_group_events(self, tmp_path):
+        agent = _FakeAgent()
+        agent.tracer = vc.Tracer(str(tmp_path))
+        flag = tmp_path / "ok"
+
+        def on_run(a, n):
+            a.tracer.new_run()
+            a.tracer.emit("run_start")
+            if n == 2:
+                flag.write_text("")
+        agent._on_run = on_run
+        vc.GoalLoop(f"test -f {flag}", str(tmp_path)).run(agent, "t", printer=_quiet)
+        ev = vc.Tracer.load(agent.tracer.path)
+        kinds = [e["ev"] for e in ev]
+        assert kinds[0] == "goal_start" and kinds[-1] == "goal_end"
+        assert [e["passed"] for e in ev if e["ev"] == "goal_round"] == [False, True]
+        assert len({e.get("group") for e in ev}) == 1  # all in one group
+        assert agent.tracer.group is None  # reset after loop
+
+    def test_config_trace_flags(self, monkeypatch):
+        monkeypatch.delenv("VIBE_TRACE", raising=False)
+        cfg = vc.Config()
+        assert cfg.trace is True
+        cfg._load_cli_args(["--no-trace", "--trace-summary", "3"])
+        assert cfg.trace is False and cfg.trace_summary == 3
+        monkeypatch.setenv("VIBE_TRACE", "0")
+        assert vc.Config().trace is False
