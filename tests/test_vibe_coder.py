@@ -10525,6 +10525,15 @@ class TestTracer:
               for i in range(5)]
         assert "Repeated:" not in vc.Tracer.summarize(ev)
 
+    def test_trace_tool_counts_bash_nonzero_exit_as_failure(self, tmp_path):
+        agent = vc.Agent.__new__(vc.Agent)
+        agent.tracer = vc.Tracer(str(tmp_path))
+        agent._trace_tool("Bash", {"command": "false"}, 0.01, False, "boom\n(exit code: 1)")
+        agent._trace_tool("Bash", {"command": "true"}, 0.01, False, "ok")
+        ev = vc.Tracer.load(agent.tracer.path)
+        assert ev[0]["ok"] is False and ev[0]["exit"] == 1
+        assert ev[1]["ok"] is True and "exit" not in ev[1]
+
     def test_goal_loop_emits_group_events(self, tmp_path):
         agent = _FakeAgent()
         agent.tracer = vc.Tracer(str(tmp_path))

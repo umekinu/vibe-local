@@ -7671,7 +7671,14 @@ class Agent:
         fields = {"name": name, "arg": Tracer.summarize_args(params),
                   "dur_ms": int((dur or 0) * 1000), "ok": not is_err,
                   "out_chars": len(output) if isinstance(output, str) else 0}
-        if is_err and isinstance(output, str):
+        # Bash reports a non-zero exit as a trailing "(exit code: N)" rather than
+        # an "Error:" prefix — count it as a failure in the trace (display unchanged).
+        if name == "Bash" and isinstance(output, str):
+            m = re.search(r"\(exit code: (-?\d+)\)\s*$", output)
+            if m:
+                fields["exit"] = int(m.group(1))
+                fields["ok"] = False
+        if not fields["ok"] and isinstance(output, str):
             fields["err"] = re.sub(r"\s+", " ", output)[:160]
         self.tracer.emit("tool", **fields)
 
