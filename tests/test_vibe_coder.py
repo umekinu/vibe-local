@@ -10510,6 +10510,30 @@ class TestTracer:
         assert "round 1: FAIL exit 1 sig abc" in out
         assert "Wall time: 5.0s" in out
 
+    def test_summarize_lists_repeated_commands(self):
+        ev = [{"ts": "2026-11-25T10:00:00.000", "ev": "run_start", "run": "r"}]
+        ev += [{"ev": "tool", "run": "r", "name": "Bash", "arg": "python3 t.py",
+                "dur_ms": 10, "ok": i == 0} for i in range(5)]
+        ev += [{"ev": "tool", "run": "r", "name": "Read", "arg": "/a.py", "dur_ms": 1, "ok": True}] * 2
+        out = vc.Tracer.summarize(ev)
+        assert "Repeated:" in out
+        assert "5×  Bash  python3 t.py  (4 failed)" in out
+        assert "Read  /a.py" not in out.split("Repeated:")[1]  # 2× is below threshold
+
+    def test_summarize_no_repeated_section_when_varied(self):
+        ev = [{"ev": "tool", "run": "r", "name": "Bash", "arg": f"cmd{i}", "dur_ms": 1, "ok": True}
+              for i in range(5)]
+        assert "Repeated:" not in vc.Tracer.summarize(ev)
+
+    def test_trace_tool_counts_bash_nonzero_exit_as_failure(self, tmp_path):
+        agent = vc.Agent.__new__(vc.Agent)
+        agent.tracer = vc.Tracer(str(tmp_path))
+        agent._trace_tool("Bash", {"command": "false"}, 0.01, False, "boom\n(exit code: 1)")
+        agent._trace_tool("Bash", {"command": "true"}, 0.01, False, "ok")
+        ev = vc.Tracer.load(agent.tracer.path)
+        assert ev[0]["ok"] is False and ev[0]["exit"] == 1
+        assert ev[1]["ok"] is True and "exit" not in ev[1]
+
     def test_goal_loop_emits_group_events(self, tmp_path):
         agent = _FakeAgent()
         agent.tracer = vc.Tracer(str(tmp_path))
