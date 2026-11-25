@@ -4649,6 +4649,7 @@ class Tracer:
 
     MAX_BYTES = 5 * 1024 * 1024   # rotate to trace.jsonl.1 beyond this
     ARG_MAX = 120                 # chars of argument summary kept per tool call
+    REPEAT_MIN = 3                # same tool+arg this many times → listed as "Repeated"
     ARG_KEYS = ("file_path", "notebook_path", "path", "command", "pattern",
                 "url", "query", "prompt")
 
@@ -4774,6 +4775,16 @@ class Tracer:
         by_name = collections.Counter(t.get("name", "?") for t in tools)
         if by_name:
             lines.append("    " + "  ".join(f"{k}×{v}" for k, v in by_name.most_common()))
+        repeated = collections.Counter(
+            (t.get("name", "?"), t.get("arg", "")) for t in tools if t.get("arg"))
+        repeated = [(k, c) for k, c in repeated.most_common(3) if c >= Tracer.REPEAT_MIN]
+        if repeated:
+            lines.append("  Repeated:")
+            for (name, arg), c in repeated:
+                fails = sum(1 for t in tools
+                            if t.get("name") == name and t.get("arg") == arg and not t.get("ok", True))
+                tail = f"  ({fails} failed)" if fails else ""
+                lines.append(f"    {c}×  {name}  {arg}{tail}")
         slow = sorted(tools, key=lambda t: -int(t.get("dur_ms") or 0))[:3]
         slow = [t for t in slow if int(t.get("dur_ms") or 0) >= 1000]
         if slow:
