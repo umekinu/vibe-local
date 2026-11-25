@@ -10561,3 +10561,59 @@ class TestTracer:
         assert cfg.trace is False and cfg.trace_summary == 3
         monkeypatch.setenv("VIBE_TRACE", "0")
         assert vc.Config().trace is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Goal loop: self-verify spin detection (round cut)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSelfVerifyCut:
+
+    def _agent(self, tmp_path, cmd="pytest -q"):
+        a = vc.Agent.__new__(vc.Agent)
+        a.tracer = vc.Tracer(str(tmp_path))
+        a.goal_watch = {"cmd": cmd, "fails": 0, "runs": 0, "limit": 3}
+        return a
+
+    def test_matches_verify_cmd_with_prefix_and_spacing(self, tmp_path):
+        a = self._agent(tmp_path)
+        assert a._is_self_verify("Bash", {"command": "cd /x &&  pytest   -q tests/"})
+        assert not a._is_self_verify("Bash", {"command": "pytest tests/"})
+        assert not a._is_self_verify("Read", {"command": "pytest -q"})
+        a.goal_watch = None
+        assert not a._is_self_verify("Bash", {"command": "pytest -q"})
+
+    def test_limit_reached_after_three_failures(self, tmp_path):
+        a = self._agent(tmp_path)
+        fail = "1 failed\n(exit code: 1)"
+        assert a._goal_watch_update("Bash", {"command": "pytest -q"}, fail) is False
+        assert a._goal_watch_update("Bash", {"command": "pytest -q"}, "ok") is False  # pass not counted
+        assert a._goal_watch_update("Bash", {"command": "ls"}, fail) is False          # unrelated
+        assert a._goal_watch_update("Bash", {"command": "cd . && pytest -q"}, fail) is False
+        assert a._goal_watch_update("Bash", {"command": "pytest -q -x"}, fail) is True
+        assert a.goal_watch["runs"] == 4 and a.goal_watch["fails"] == 3
+
+    def test_trace_marks_self_verify(self, tmp_path):
+        a = self._agent(tmp_path)
+        a._trace_tool("Bash", {"command": "pytest -q"}, 0.1, False, "x\n(exit code: 1)")
+        a._trace_tool("Bash", {"command": "ls"}, 0.1, False, "x")
+        ev = vc.Tracer.load(a.tracer.path)
+        assert ev[0].get("self_verify") is True and "self_verify" not in ev[1]
+        out = vc.Tracer.summarize([dict(e, run="r") for e in ev] +
+                                  [{"ev": "run_end", "run": "r", "status": "self_verify_limit", "steps": 4}])
+        assert "Self-verify by model: 1 run(s) (1 failed, 1 round(s) cut)" in out
+
+    def test_goal_loop_sets_watch_and_notes_cut_in_feedback(self, tmp_path):
+        seen = []
+
+        def on_run(agent, n):
+            seen.append(dict(agent.goal_watch))
+            agent.last_run_status = "self_verify_limit" if n == 1 else "done"
+
+        agent = _FakeAgent(on_run)
+        gl = vc.GoalLoop('[ "${VIBE_GOAL_ROUND:-0}" -ge 2 ] || exit 1', str(tmp_path))
+        res = gl.run(agent, "t", printer=_quiet)
+        assert res == {"status": "passed", "rounds": 2}
+        assert all(w["fails"] == 0 and w["limit"] == vc.GoalLoop.SELF_VERIFY_LIMIT for w in seen)
+        assert "previous round was stopped" in agent.prompts[1]
+        assert agent.goal_watch is None  # cleared after the loop

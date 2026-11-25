@@ -4771,6 +4771,13 @@ class Tracer:
         lines.append(f"  LLM calls: {len(llm)}  ({llm_ms / 1000:.1f}s, tokens {p_tok}→{c_tok})")
         errs = [t for t in tools if not t.get("ok", True)]
         lines.append(f"  Tool calls: {len(tools)}  ({tool_ms / 1000:.1f}s, errors {len(errs)})")
+        sv = [t for t in tools if t.get("self_verify")]
+        if sv:
+            sv_fail = sum(1 for t in sv if not t.get("ok", True))
+            cuts = sum(1 for e in unit_events
+                       if e.get("ev") == "run_end" and e.get("status") == "self_verify_limit")
+            cut_txt = f", {cuts} round(s) cut" if cuts else ""
+            lines.append(f"  Self-verify by model: {len(sv)} run(s) ({sv_fail} failed{cut_txt})")
 
         by_name = collections.Counter(t.get("name", "?") for t in tools)
         if by_name:
@@ -4828,6 +4835,7 @@ class GoalLoop:
     DEFAULT_MAX_ROUNDS = 5
     HARD_MAX_ROUNDS = 50
     NO_PROGRESS_LIMIT = 3      # identical failure signature this many rounds in a row → stop
+    SELF_VERIFY_LIMIT = 3      # model's own failing verify runs per round before the round is cut
     OUTPUT_TAIL = 3000         # chars of verifier output fed back to the model
     HISTORY_ENTRIES = 5        # past entries injected from progress.md
     PROGRESS_EXCERPT = 800     # chars of verifier output stored per entry
@@ -4954,7 +4962,7 @@ class GoalLoop:
             parts += history
         return "\n".join(parts)
 
-    def build_feedback_prompt(self, round_no, exit_code, output, repeated):
+    def build_feedback_prompt(self, round_no, exit_code, output, repeated, cut=False):
         lines = [
             f"[GOAL NOT MET — round {round_no}/{self.max_rounds}] "
             f"`{self.verify_cmd}` exited with status {exit_code}.",
@@ -4964,6 +4972,10 @@ class GoalLoop:
             "```",
             "Find the root cause and fix it, then run the command again to confirm.",
         ]
+        if cut:
+            lines.append(f"NOTE: the previous round was stopped because your own runs of `{self.verify_cmd}` "
+                         f"failed {self.SELF_VERIFY_LIMIT} times. Re-running the check does not fix it — "
+                         "change the code, and never try to fake or bypass the check.")
         if repeated:
             lines.append("WARNING: this is the SAME failure as the previous round. "
                          "Your last fix did not change anything — try a different approach.")
@@ -4985,6 +4997,8 @@ class GoalLoop:
         finally:
             if tracer is not None:
                 tracer.group = None
+            if hasattr(agent, "goal_watch"):
+                agent.goal_watch = None
 
     def _run_rounds(self, agent, task, prompt, printer, tracer):
         y, g, r, d, rst = C.YELLOW, C.GREEN, C.RED, C.DIM, C.RESET
@@ -4996,7 +5010,10 @@ class GoalLoop:
             return {"status": status, "rounds": rounds}
 
         for round_no in range(1, self.max_rounds + 1):
+            agent.goal_watch = {"cmd": self.verify_cmd, "fails": 0, "runs": 0,
+                                "limit": self.SELF_VERIFY_LIMIT}
             agent.run(prompt, auto_parallel=False)
+            cut = getattr(agent, "last_run_status", None) == "self_verify_limit"
             if agent._interrupted.is_set():
                 printer(f"{y}◎ Goal loop stopped by user (round {round_no}).{rst}")
                 return _end("interrupted", round_no)
@@ -5022,7 +5039,8 @@ class GoalLoop:
                 return _end("no_progress", round_no)
             if round_no == self.max_rounds:
                 break
-            prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2)
+            prompt = self.build_feedback_prompt(round_no, code, output, repeated=same_count >= 2,
+                                                cut=cut)
         printer(f"{y}◎ Goal not met after {self.max_rounds} rounds. See .vibe/progress.md.{rst}")
         return _end("max_rounds", self.max_rounds)
 
@@ -7139,6 +7157,8 @@ class Agent:
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
         self.goal_loop = None  # GoalLoop when /goal or --goal is active
+        self.goal_watch = None  # set by GoalLoop per round: {"cmd", "fails", "runs", "limit"}
+        self.last_run_status = None
         self.tracer = Tracer(config.cwd, enabled=getattr(config, "trace", True), session=session)
 
     @staticmethod
@@ -7215,6 +7235,7 @@ class Agent:
                          plan_mode=self._plan_mode)
         _end_status = "unknown"
         _steps = 0
+        _self_verify_stop = False
         _recent_tool_calls = []  # track recent calls for loop detection
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
@@ -7520,6 +7541,8 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            if self._goal_watch_update(tool_name, tool_params, output):
+                                _self_verify_stop = True
 
                             # Detect plan file creation
                             if tool_name == "Write" and self._plan_mode and not _is_err:
@@ -7580,6 +7603,15 @@ class Agent:
                 # Skip compaction if interrupted — just save partial results and break
                 if self._interrupted.is_set():
                     _end_status = "interrupted"
+                    break
+
+                # Goal loop: the model's own verify runs keep failing → end this
+                # round and let the harness verify and feed back (avoids spinning)
+                if _self_verify_stop:
+                    _gw = self.goal_watch or {}
+                    _p(f"\n{C.YELLOW}◎ Your own runs of the goal command failed "
+                       f"{_gw.get('fails')} times this round — handing over to verification.{C.RESET}")
+                    _end_status = "self_verify_limit"
                     break
 
                 # 7. Context compaction check
@@ -7666,6 +7698,37 @@ class Agent:
         self._last_typeahead = _esc_monitor.get_typeahead()
         _esc_monitor.stop()
 
+    @staticmethod
+    def _bash_failed(output):
+        """True if a Bash tool output indicates failure."""
+        if not isinstance(output, str):
+            return False
+        return (output.startswith("Error:") or output.startswith("Error -")
+                or re.search(r"\(exit code: -?\d+\)\s*$", output) is not None)
+
+    def _is_self_verify(self, name, params):
+        """True if this tool call runs the active goal's verify command."""
+        gw = getattr(self, "goal_watch", None)
+        if not gw or name != "Bash" or not isinstance(params, dict):
+            return False
+        cmd = params.get("command")
+        if not isinstance(cmd, str):
+            return False
+        norm = lambda x: re.sub(r"\s+", " ", x).strip()
+        return norm(gw["cmd"]) in norm(cmd)
+
+    def _goal_watch_update(self, name, params, output):
+        """Count the model's own verify runs; return True when the per-round
+        failure limit is reached (the round should end and hand over to the
+        harness verification)."""
+        if not self._is_self_verify(name, params):
+            return False
+        gw = self.goal_watch
+        gw["runs"] += 1
+        if self._bash_failed(output):
+            gw["fails"] += 1
+        return gw["fails"] >= gw["limit"]
+
     def _trace_tool(self, name, params, dur, is_err, output):
         """Record one tool call (metadata only) in the trace log."""
         fields = {"name": name, "arg": Tracer.summarize_args(params),
@@ -7678,6 +7741,8 @@ class Agent:
             if m:
                 fields["exit"] = int(m.group(1))
                 fields["ok"] = False
+        if self._is_self_verify(name, params):
+            fields["self_verify"] = True
         if not fields["ok"] and isinstance(output, str):
             fields["err"] = re.sub(r"\s+", " ", output)[:160]
         self.tracer.emit("tool", **fields)
